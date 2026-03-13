@@ -26,7 +26,7 @@ logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
 
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("gsc-server")
+mcp = FastMCP("mcp-seo-audit")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuration

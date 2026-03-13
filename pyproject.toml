@@ -1,7 +1,7 @@
 [project]
-name = "mcp-gsc-enhanced"
+name = "mcp-seo-audit"
 version = "1.0.0"
-description = "Enhanced Google Search Console + Indexing API + Core Web Vitals MCP server"
+description = "SEO audit & indexing MCP server — Google Search Console, Indexing API, Core Web Vitals, and site analysis tools"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
