@@ -4,6 +4,10 @@ A Model Context Protocol (MCP) server for SEO auditing, Google Search Console an
 
 Forked from [AminForou/mcp-gsc](https://github.com/AminForou/mcp-gsc) and rewritten with 23 tools, bug fixes, and a full test suite.
 
+<a href="https://glama.ai/mcp/servers/GiorgiKemo/mcp-seo-audit">
+  <img width="380" height="200" src="https://glama.ai/mcp/servers/GiorgiKemo/mcp-seo-audit/badge" alt="mcp-seo-audit MCP server" />
+</a>
+
 ---
 
 ## What It Does
