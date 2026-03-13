@@ -28,8 +28,8 @@ dependencies = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/GiorgiKemo/mcp-gsc"
-"Bug Tracker" = "https://github.com/GiorgiKemo/mcp-gsc/issues"
+"Homepage" = "https://github.com/GiorgiKemo/mcp-seo-audit"
+"Bug Tracker" = "https://github.com/GiorgiKemo/mcp-seo-audit/issues"
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
