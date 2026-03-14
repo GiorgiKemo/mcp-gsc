@@ -4,15 +4,16 @@ Google Search Console + Indexing API + Core Web Vitals integration for MCP.
 """
 
 # ── Auto-activate .venv if running from system Python (e.g. Glama Docker) ────
-import os, sys, site
+import os, sys, site, glob
 _venv = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".venv")
 if os.path.isdir(_venv) and _venv not in sys.prefix:
-    _sp = os.path.join(_venv, "lib", f"python{sys.version_info.major}.{sys.version_info.minor}", "site-packages")
-    if not os.path.isdir(_sp):
-        # Windows or non-standard layout
-        _sp = os.path.join(_venv, "Lib", "site-packages")
-    if os.path.isdir(_sp):
+    # Find any site-packages dir in the venv (version may differ from running Python)
+    for _sp in glob.glob(os.path.join(_venv, "lib", "python*", "site-packages")):
         site.addsitedir(_sp)
+    # Windows layout
+    _sp_win = os.path.join(_venv, "Lib", "site-packages")
+    if os.path.isdir(_sp_win):
+        site.addsitedir(_sp_win)
 
 from typing import Any, Dict, List, Optional
 import logging
