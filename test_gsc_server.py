@@ -9,9 +9,10 @@ import json
 import os
 import sys
 from datetime import datetime, timedelta
-from unittest.mock import MagicMock, patch, mock_open
+from unittest.mock import AsyncMock, MagicMock, patch, mock_open
 
 import pytest
+import httpx
 
 # Set env vars BEFORE importing the module to avoid startup errors
 os.environ.setdefault("GSC_SKIP_OAUTH", "true")
@@ -822,6 +823,196 @@ class TestHelpers:
 
 # ─── Edge Case / Regression Tests ─────────────────────────────────────────
 
+class TestPublicWebAuditTools:
+    @patch("gsc_server.httpx.AsyncClient")
+    def test_get_pagespeed_insights_success(self, mock_client_cls):
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "loadingExperience": {
+                "metrics": {
+                    "LARGEST_CONTENTFUL_PAINT_MS": {"percentile": 2200, "category": "FAST"},
+                }
+            },
+            "lighthouseResult": {
+                "categories": {
+                    "performance": {"score": 0.91},
+                    "seo": {"score": 1.0},
+                },
+                "audits": {
+                    "first-contentful-paint": {"title": "First Contentful Paint", "displayValue": "1.2 s"},
+                    "largest-contentful-paint": {"title": "Largest Contentful Paint", "displayValue": "2.2 s"},
+                },
+            },
+        }
+
+        client = AsyncMock()
+        client.get.return_value = response
+        mock_client_cls.return_value.__aenter__.return_value = client
+
+        result = run(gs.get_pagespeed_insights("https://example.com"))
+        assert "PageSpeed Insights" in result
+        assert "performance: 91" in result
+        assert "LARGEST_CONTENTFUL_PAINT_MS" in result
+
+    def test_get_pagespeed_insights_invalid_strategy(self):
+        result = run(gs.get_pagespeed_insights("https://example.com", strategy="tablet"))
+        assert "Invalid strategy" in result
+
+    @patch("gsc_server.httpx.AsyncClient")
+    def test_get_pagespeed_insights_quota_guidance(self, mock_client_cls):
+        request = httpx.Request("GET", "https://www.googleapis.com/pagespeedonline/v5/runPagespeed")
+        response = httpx.Response(429, text='{"error":"quota"}', request=request)
+
+        client = AsyncMock()
+        client.get.side_effect = httpx.HTTPStatusError("quota", request=request, response=response)
+        mock_client_cls.return_value.__aenter__.return_value = client
+
+        result = run(gs.get_pagespeed_insights("https://example.com"))
+        assert "quota was exceeded" in result
+
+    @patch("gsc_server.subprocess.run")
+    @patch("gsc_server.shutil.which")
+    def test_run_lighthouse_audit_success(self, mock_which, mock_run):
+        mock_which.return_value = "npx"
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "categories": {
+                        "performance": {"score": 0.88},
+                        "seo": {"score": 1.0},
+                    },
+                    "audits": {
+                        "first-contentful-paint": {"title": "First Contentful Paint", "displayValue": "1.0 s"},
+                        "largest-contentful-paint": {"title": "Largest Contentful Paint", "displayValue": "2.5 s"},
+                    },
+                }
+            ),
+            stderr="",
+        )
+
+        result = run(gs.run_lighthouse_audit("https://example.com"))
+        assert "Local Lighthouse audit" in result
+        assert "performance: 88" in result
+
+    @patch("gsc_server.shutil.which")
+    def test_run_lighthouse_audit_missing_npx(self, mock_which):
+        mock_which.return_value = None
+        result = run(gs.run_lighthouse_audit("https://example.com"))
+        assert "npx is not available" in result
+
+    @patch("gsc_server._fetch_url", new_callable=AsyncMock)
+    def test_inspect_robots_txt(self, mock_fetch):
+        mock_fetch.return_value = MagicMock(
+            status_code=200,
+            text="User-agent: *\nDisallow: /private\nSitemap: https://example.com/sitemap.xml\n",
+        )
+        result = run(gs.inspect_robots_txt("https://example.com"))
+        assert "robots.txt inspection" in result
+        assert "/private" in result
+        assert "sitemap.xml" in result
+
+    @patch("gsc_server._fetch_url", new_callable=AsyncMock)
+    def test_analyze_sitemap_urlset(self, mock_fetch):
+        sitemap_response = httpx.Response(
+            200,
+            content=b"""<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://example.com/</loc><lastmod>2026-04-01</lastmod></url>
+  <url><loc>https://example.com/jobs</loc></url>
+</urlset>""",
+            headers={"content-type": "application/xml"},
+            request=httpx.Request("GET", "https://example.com/sitemap.xml"),
+        )
+        page_response = MagicMock(status_code=200)
+        mock_fetch.side_effect = [sitemap_response, page_response, page_response]
+        result = run(gs.analyze_sitemap("https://example.com/sitemap.xml", sample_urls=2))
+        assert "URLs listed: 2" in result
+        assert "Sample URL status checks" in result
+
+    @patch("gsc_server._fetch_url", new_callable=AsyncMock)
+    def test_analyze_page_seo(self, mock_fetch):
+        html = """
+        <html lang="en">
+          <head>
+            <title>Example title for testing</title>
+            <meta name="description" content="Example meta description for testing page output." />
+            <link rel="canonical" href="https://example.com/test" />
+            <script type="application/ld+json">{"@context":"https://schema.org","@type":"WebPage"}</script>
+          </head>
+          <body><h1>Primary heading</h1></body>
+        </html>
+        """
+        mock_fetch.return_value = httpx.Response(
+            200,
+            text=html,
+            headers={"content-type": "text/html"},
+            request=httpx.Request("GET", "https://example.com/test"),
+        )
+        result = run(gs.analyze_page_seo("https://example.com/test"))
+        assert "Page SEO analysis" in result
+        assert "Primary heading" in result
+        assert "WebPage" in result
+
+    @patch("gsc_server._fetch_url", new_callable=AsyncMock)
+    def test_crawl_site_seo(self, mock_fetch):
+        home = httpx.Response(
+            200,
+            text="""
+            <html><head><title>Home</title><meta name="description" content="Home desc" /></head>
+            <body><h1>Home</h1><a href="/about">About</a></body></html>
+            """,
+            headers={"content-type": "text/html"},
+            request=httpx.Request("GET", "https://example.com/"),
+        )
+        about = httpx.Response(
+            200,
+            text="""
+            <html><head><title>About</title></head>
+            <body><h1>About</h1></body></html>
+            """,
+            headers={"content-type": "text/html"},
+            request=httpx.Request("GET", "https://example.com/about"),
+        )
+        mock_fetch.side_effect = [home, about]
+        result = run(gs.crawl_site_seo("https://example.com", max_pages=2))
+        assert "Pages crawled: 2 / 2" in result
+        assert "Pages missing meta description: 1" in result
+
+    @patch("gsc_server.run_lighthouse_audit", new_callable=AsyncMock)
+    @patch("gsc_server.crawl_site_seo", new_callable=AsyncMock)
+    @patch("gsc_server.get_pagespeed_insights", new_callable=AsyncMock)
+    @patch("gsc_server.analyze_sitemap", new_callable=AsyncMock)
+    @patch("gsc_server.inspect_robots_txt", new_callable=AsyncMock)
+    @patch("gsc_server.analyze_page_seo", new_callable=AsyncMock)
+    @patch("gsc_server._fetch_url", new_callable=AsyncMock)
+    def test_audit_live_site_composes_tools(
+        self,
+        mock_fetch,
+        mock_page,
+        mock_robots,
+        mock_sitemap,
+        mock_psi,
+        mock_crawl,
+        mock_lighthouse,
+    ):
+        mock_page.return_value = "page analysis"
+        mock_robots.return_value = "robots report"
+        mock_sitemap.return_value = "sitemap report"
+        mock_psi.return_value = "psi report"
+        mock_crawl.return_value = "crawl report"
+        mock_lighthouse.return_value = "lighthouse report"
+        mock_fetch.return_value = MagicMock(text="Sitemap: https://example.com/sitemap.xml")
+        result = run(gs.audit_live_site("https://example.com", include_lighthouse=True))
+        assert "page analysis" in result
+        assert "robots report" in result
+        assert "sitemap report" in result
+        assert "psi report" in result
+        assert "crawl report" in result
+        assert "lighthouse report" in result
+
+
 class TestEdgeCases:
     @patch("gsc_server.get_gsc_service")
     def test_404_triggers_helpful_error(self, mock_get):
@@ -850,9 +1041,9 @@ class TestEdgeCases:
         result = run(gs.batch_inspect_urls("sc-domain:example.com", "https://example.com/test"))
         assert "Errors: 1" in result
 
-    def test_module_has_23_tools(self):
+    def test_module_has_30_tools(self):
         tools = list(gs.mcp._tool_manager._tools.keys())
-        assert len(tools) == 23
+        assert len(tools) == 30
 
     def test_all_expected_tools_registered(self):
         tools = set(gs.mcp._tool_manager._tools.keys())
@@ -864,6 +1055,8 @@ class TestEdgeCases:
             "get_sitemaps", "submit_sitemap", "delete_sitemap",
             "request_indexing", "request_removal", "batch_request_indexing", "check_indexing_notification",
             "get_core_web_vitals",
+            "get_pagespeed_insights", "run_lighthouse_audit", "inspect_robots_txt",
+            "analyze_sitemap", "analyze_page_seo", "crawl_site_seo", "audit_live_site",
             "find_striking_distance_keywords", "detect_cannibalization", "split_branded_queries",
             "site_audit", "reauthenticate",
         }

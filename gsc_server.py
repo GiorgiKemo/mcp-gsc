@@ -15,13 +15,20 @@ if os.path.isdir(_venv) and _venv not in sys.prefix:
     if os.path.isdir(_sp_win):
         site.addsitedir(_sp_win)
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 import logging
 import json
 import asyncio
 import time
 import math
-from urllib.parse import urlparse
+import gzip
+import re
+import shutil
+import subprocess
+import xml.etree.ElementTree as ET
+from collections import Counter, deque
+from html import unescape
+from urllib.parse import urlparse, urljoin, urlunsplit
 from datetime import datetime, timedelta
 
 import google.auth
@@ -31,9 +38,13 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+import httpx
+from bs4 import BeautifulSoup
 
 # Suppress the noisy file_cache warning from google-api-python-client.
 logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 from mcp.server.fastmcp import FastMCP
 
@@ -75,6 +86,19 @@ INDEXING_SCOPES = ["https://www.googleapis.com/auth/indexing"]
 
 # CrUX API key (free, no OAuth needed)
 CRUX_API_KEY = os.environ.get("CRUX_API_KEY", "")
+
+# PageSpeed Insights API key (optional, but recommended for stable quota)
+PAGESPEED_API_KEY = os.environ.get("PAGESPEED_API_KEY", os.environ.get("GOOGLE_API_KEY", ""))
+
+# Optional explicit Chrome path for local Lighthouse runs
+LIGHTHOUSE_CHROME_PATH = os.environ.get("LIGHTHOUSE_CHROME_PATH", os.environ.get("CHROME_PATH", ""))
+
+DEFAULT_FETCH_HEADERS = {
+    "User-Agent": "mcp-seo-audit/2.0 (+https://github.com/GiorgiKemo/mcp-seo-audit)",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5",
+}
+DEFAULT_FETCH_TIMEOUT = httpx.Timeout(connect=10.0, read=20.0, write=20.0, pool=20.0)
+LIGHTHOUSE_CATEGORIES = {"performance", "accessibility", "best-practices", "seo", "pwa"}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Authentication helpers
@@ -223,6 +247,356 @@ def _site_not_found_error(site_url: str) -> str:
             "the correct format is 'sc-domain:example.com', not a full URL."
         )
     lines.append("3. The authenticated account may not have access to this property.")
+    return "\n".join(lines)
+
+
+def _ensure_https_url(url_or_origin: str) -> str:
+    """Normalize a property/origin/url into a fetchable HTTPS URL."""
+    value = (url_or_origin or "").strip()
+    if not value:
+        raise ValueError("A URL or origin is required.")
+    if value.startswith("sc-domain:"):
+        return f"https://{value.split(':', 1)[1].strip('/')}"
+    parsed = urlparse(value)
+    if not parsed.scheme:
+        return f"https://{value.lstrip('/')}"
+    return value
+
+
+def _origin_from_url(url_or_origin: str) -> str:
+    url = _ensure_https_url(url_or_origin)
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _clean_text(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return re.sub(r"\s+", " ", unescape(value)).strip()
+
+
+def _clip(value: str, limit: int = 120) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: limit - 3].rstrip() + "..."
+
+
+def _status_class(status_code: int) -> str:
+    if 200 <= status_code < 300:
+        return "ok"
+    if 300 <= status_code < 400:
+        return "redirect"
+    if 400 <= status_code < 500:
+        return "client_error"
+    if status_code >= 500:
+        return "server_error"
+    return "unknown"
+
+
+def _canonicalize_crawl_url(base_url: str, href: str) -> Optional[str]:
+    if not href:
+        return None
+    absolute = urljoin(base_url, href)
+    parsed = urlparse(absolute)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return None
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", "", ""))
+
+
+async def _fetch_url(
+    url: str,
+    *,
+    method: str = "GET",
+    follow_redirects: bool = True,
+    headers: Optional[Dict[str, str]] = None,
+) -> httpx.Response:
+    request_headers = dict(DEFAULT_FETCH_HEADERS)
+    if headers:
+        request_headers.update(headers)
+
+    async with httpx.AsyncClient(
+        follow_redirects=follow_redirects,
+        timeout=DEFAULT_FETCH_TIMEOUT,
+        headers=request_headers,
+    ) as client:
+        response = await client.request(method, url)
+        return response
+
+
+def _extract_json_ld_types(value: Any, types: Set[str]) -> None:
+    if isinstance(value, dict):
+        schema_type = value.get("@type")
+        if isinstance(schema_type, list):
+            for item in schema_type:
+                if item:
+                    types.add(str(item))
+        elif schema_type:
+            types.add(str(schema_type))
+        for nested in value.values():
+            _extract_json_ld_types(nested, types)
+    elif isinstance(value, list):
+        for item in value:
+            _extract_json_ld_types(item, types)
+
+
+def _parse_json_ld_types(soup: BeautifulSoup) -> List[str]:
+    discovered: Set[str] = set()
+    for script in soup.find_all("script"):
+        script_type = (script.get("type") or "").lower()
+        if "ld+json" not in script_type:
+            continue
+        raw = script.string or script.get_text(" ", strip=True)
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            cleaned = raw.replace("<!--", "").replace("-->", "").strip()
+            try:
+                parsed = json.loads(cleaned)
+            except Exception:
+                continue
+        _extract_json_ld_types(parsed, discovered)
+    return sorted(discovered)
+
+
+def _parse_meta_tags(soup: BeautifulSoup) -> Dict[str, str]:
+    meta: Dict[str, str] = {}
+    for tag in soup.find_all("meta"):
+        key = (tag.get("name") or tag.get("property") or "").strip().lower()
+        value = _clean_text(tag.get("content"))
+        if key and value and key not in meta:
+            meta[key] = value
+    return meta
+
+
+def _analyze_html_document(final_url: str, status_code: int, headers: Dict[str, str], html: str) -> Dict[str, Any]:
+    soup = BeautifulSoup(html, "html.parser")
+    meta = _parse_meta_tags(soup)
+
+    title_text = _clean_text(soup.title.get_text(" ", strip=True) if soup.title else "")
+    canonical_tags = []
+    for link in soup.find_all("link"):
+        rel = link.get("rel") or []
+        rel_values = [str(item).lower() for item in (rel if isinstance(rel, list) else [rel])]
+        if "canonical" in rel_values:
+            href = _clean_text(link.get("href"))
+            if href:
+                canonical_tags.append(href)
+
+    hreflangs = []
+    for link in soup.find_all("link"):
+        hreflang = _clean_text(link.get("hreflang"))
+        href = _clean_text(link.get("href"))
+        if hreflang and href:
+            hreflangs.append((hreflang, href))
+
+    headings = {
+        "h1": [_clean_text(tag.get_text(" ", strip=True)) for tag in soup.find_all("h1") if _clean_text(tag.get_text(" ", strip=True))],
+        "h2": [_clean_text(tag.get_text(" ", strip=True)) for tag in soup.find_all("h2") if _clean_text(tag.get_text(" ", strip=True))],
+    }
+
+    body_text = _clean_text(soup.get_text(" ", strip=True))
+    structured_types = _parse_json_ld_types(soup)
+    x_robots = _clean_text(headers.get("x-robots-tag", ""))
+    robots_meta = meta.get("robots", "")
+    googlebot_meta = meta.get("googlebot", "")
+    issues: List[str] = []
+    notes: List[str] = []
+
+    if status_code >= 400:
+        issues.append(f"HTTP status {status_code}")
+    if not title_text:
+        issues.append("Missing <title>")
+    elif len(title_text) > 60:
+        notes.append(f"Title is long ({len(title_text)} chars)")
+    elif len(title_text) < 15:
+        notes.append(f"Title is short ({len(title_text)} chars)")
+
+    description = meta.get("description", "")
+    if not description:
+        issues.append("Missing meta description")
+    elif len(description) > 160:
+        notes.append(f"Meta description is long ({len(description)} chars)")
+    elif len(description) < 70:
+        notes.append(f"Meta description is short ({len(description)} chars)")
+
+    if len(canonical_tags) > 1:
+        issues.append("Multiple canonical tags found")
+    if canonical_tags:
+        canonical_url = canonical_tags[0]
+        if urlparse(canonical_url).netloc and urlparse(canonical_url).netloc != urlparse(final_url).netloc:
+            notes.append(f"Canonical points to another host: {canonical_url}")
+    else:
+        notes.append("No canonical tag found")
+
+    indexability_signals = " | ".join(part for part in [robots_meta, googlebot_meta, x_robots] if part).lower()
+    if "noindex" in indexability_signals:
+        issues.append("Page is explicitly marked noindex")
+
+    if not headings["h1"]:
+        issues.append("Missing H1")
+    elif len(headings["h1"]) > 1:
+        notes.append(f"Multiple H1 tags found ({len(headings['h1'])})")
+
+    if not meta.get("og:title"):
+        notes.append("Missing og:title")
+    if not meta.get("og:description"):
+        notes.append("Missing og:description")
+    if not meta.get("og:image"):
+        notes.append("Missing og:image")
+    if not meta.get("twitter:card"):
+        notes.append("Missing twitter:card")
+
+    return {
+        "title": title_text,
+        "meta_description": description,
+        "meta": meta,
+        "canonicals": canonical_tags,
+        "hreflangs": hreflangs,
+        "headings": headings,
+        "structured_types": structured_types,
+        "x_robots_tag": x_robots,
+        "issues": issues,
+        "notes": notes,
+        "body_word_count": len(body_text.split()) if body_text else 0,
+    }
+
+
+def _iter_internal_links(final_url: str, html: str) -> List[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    parsed_final = urlparse(final_url)
+    origin = f"{parsed_final.scheme}://{parsed_final.netloc}"
+    links: List[str] = []
+    seen: Set[str] = set()
+    for anchor in soup.find_all("a", href=True):
+        normalized = _canonicalize_crawl_url(final_url, anchor["href"])
+        if not normalized:
+            continue
+        parsed = urlparse(normalized)
+        if f"{parsed.scheme}://{parsed.netloc}" != origin:
+            continue
+        if normalized not in seen:
+            seen.add(normalized)
+            links.append(normalized)
+    return links
+
+
+def _extract_xml_text(response: httpx.Response) -> str:
+    content = response.content
+    content_type = response.headers.get("content-type", "").lower()
+    if response.url.path.endswith(".gz") or "gzip" in content_type:
+        try:
+            content = gzip.decompress(content)
+        except Exception:
+            pass
+    return content.decode(response.encoding or "utf-8", errors="replace")
+
+
+def _local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def _parse_sitemap_document(xml_text: str) -> Dict[str, Any]:
+    root = ET.fromstring(xml_text)
+    root_name = _local_name(root.tag)
+    if root_name == "sitemapindex":
+        sitemaps = []
+        for node in root.findall(".//"):
+            if _local_name(node.tag) == "loc" and node.text:
+                sitemaps.append(node.text.strip())
+        return {"type": "sitemapindex", "sitemaps": sitemaps, "urls": []}
+
+    if root_name == "urlset":
+        urls = []
+        lastmods = 0
+        for url_node in root.findall(".//"):
+            if _local_name(url_node.tag) == "url":
+                loc = None
+                lastmod = None
+                for child in list(url_node):
+                    child_name = _local_name(child.tag)
+                    if child_name == "loc" and child.text:
+                        loc = child.text.strip()
+                    elif child_name == "lastmod" and child.text:
+                        lastmod = child.text.strip()
+                if loc:
+                    urls.append({"loc": loc, "lastmod": lastmod})
+                    if lastmod:
+                        lastmods += 1
+        return {"type": "urlset", "sitemaps": [], "urls": urls, "lastmod_count": lastmods}
+
+    raise ValueError(f"Unsupported sitemap root element: {root_name}")
+
+
+def _format_loading_experience(experience: Dict[str, Any], label: str) -> List[str]:
+    if not experience:
+        return [f"{label}: no field data"]
+    lines = [f"{label}:"]
+    for metric_name, metric in experience.get("metrics", {}).items():
+        percentile = metric.get("percentile")
+        category = metric.get("category", "N/A")
+        lines.append(f"  {metric_name}: p75={percentile} ({category})")
+    return lines
+
+
+def _summarize_lighthouse_payload(payload: Dict[str, Any], source_label: str) -> str:
+    result = payload.get("lighthouseResult", payload)
+    categories = result.get("categories", {})
+    audits = result.get("audits", {})
+    lines = [source_label]
+
+    if categories:
+        lines.append("Category scores:")
+        for key in ["performance", "seo", "accessibility", "best-practices", "pwa"]:
+            category = categories.get(key)
+            if not category:
+                continue
+            score = category.get("score")
+            score_text = "N/A" if score is None else f"{round(score * 100)}"
+            lines.append(f"  {key}: {score_text}")
+
+    metric_ids = [
+        "first-contentful-paint",
+        "largest-contentful-paint",
+        "speed-index",
+        "interactive",
+        "total-blocking-time",
+        "cumulative-layout-shift",
+    ]
+    lines.append("Key metrics:")
+    for audit_id in metric_ids:
+        audit = audits.get(audit_id)
+        if not audit:
+            continue
+        value = audit.get("displayValue") or audit.get("numericValue") or "N/A"
+        lines.append(f"  {audit.get('title', audit_id)}: {value}")
+
+    opportunities = []
+    for audit_id, audit in audits.items():
+        score = audit.get("score")
+        savings_ms = 0
+        details = audit.get("details") or {}
+        if isinstance(details, dict):
+            savings_ms = details.get("overallSavingsMs") or 0
+        numeric_value = audit.get("numericValue") or 0
+        if score is not None and score < 0.9:
+            opportunities.append(
+                (
+                    savings_ms,
+                    numeric_value,
+                    audit.get("title", audit_id),
+                    audit.get("displayValue", ""),
+                )
+            )
+    opportunities.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    if opportunities:
+        lines.append("Top opportunities / failing audits:")
+        for _, _, title, display_value in opportunities[:8]:
+            suffix = f" ({display_value})" if display_value else ""
+            lines.append(f"  {title}{suffix}")
+
     return "\n".join(lines)
 
 
@@ -1142,6 +1516,495 @@ async def get_core_web_vitals(url_or_origin: str, form_factor: str = "PHONE") ->
 # ──────────────────────────────────────────────────────────────────────────────
 # NEW: SEO Analysis Tools
 # ──────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def get_pagespeed_insights(
+    url: str,
+    strategy: str = "mobile",
+    categories: str = "performance,seo,accessibility,best-practices",
+) -> str:
+    """
+    Run Google's PageSpeed Insights API for a URL.
+    Returns Lighthouse lab data plus available Chrome UX Report field data.
+
+    Args:
+        url: Full page URL
+        strategy: mobile or desktop
+        categories: Comma-separated Lighthouse categories
+    """
+    normalized_url = _ensure_https_url(url)
+    strategy_value = strategy.lower().strip()
+    if strategy_value not in {"mobile", "desktop"}:
+        return "Invalid strategy. Use 'mobile' or 'desktop'."
+
+    selected_categories = []
+    for raw in categories.split(","):
+        category = raw.strip().lower()
+        if not category:
+            continue
+        if category not in LIGHTHOUSE_CATEGORIES:
+            return f"Invalid Lighthouse category '{category}'. Allowed: {', '.join(sorted(LIGHTHOUSE_CATEGORIES))}"
+        selected_categories.append(category)
+    if not selected_categories:
+        selected_categories = ["performance", "seo"]
+
+    params = [("url", normalized_url), ("strategy", strategy_value)]
+    for category in selected_categories:
+        params.append(("category", category))
+    if PAGESPEED_API_KEY:
+        params.append(("key", PAGESPEED_API_KEY))
+
+    try:
+        async with httpx.AsyncClient(timeout=DEFAULT_FETCH_TIMEOUT, headers=DEFAULT_FETCH_HEADERS) as client:
+            response = await client.get(
+                "https://www.googleapis.com/pagespeedonline/v5/runPagespeed",
+                params=params,
+            )
+        response.raise_for_status()
+        payload = response.json()
+
+        lines = [f"PageSpeed Insights for {normalized_url} ({strategy_value})"]
+        lines.append(_summarize_lighthouse_payload(payload, "Lighthouse / PSI summary"))
+        lines.extend(_format_loading_experience(payload.get("loadingExperience", {}), "URL field data"))
+        origin_data = payload.get("originLoadingExperience", {})
+        if origin_data:
+            lines.extend(_format_loading_experience(origin_data, "Origin field data"))
+        return "\n".join(lines)
+    except httpx.HTTPStatusError as exc:
+        body = exc.response.text[:300]
+        safe_body = body.replace(PAGESPEED_API_KEY, "[REDACTED]") if PAGESPEED_API_KEY else body
+        if exc.response.status_code == 429:
+            guidance = (
+                " PageSpeed quota was exceeded. "
+                "Set PAGESPEED_API_KEY (or GOOGLE_API_KEY) to use your own Google API quota."
+            )
+        else:
+            guidance = ""
+        return f"PageSpeed Insights error (HTTP {exc.response.status_code}): {safe_body}{guidance}"
+    except Exception as exc:
+        return f"Error running PageSpeed Insights: {str(exc)}"
+
+
+@mcp.tool()
+async def run_lighthouse_audit(
+    url: str,
+    form_factor: str = "mobile",
+    categories: str = "performance,seo,accessibility,best-practices",
+) -> str:
+    """
+    Run a local Lighthouse CLI audit via npx.
+    Requires Node.js plus a locally available Chrome/Chromium browser.
+
+    Args:
+        url: Full page URL
+        form_factor: mobile or desktop
+        categories: Comma-separated Lighthouse categories
+    """
+    normalized_url = _ensure_https_url(url)
+    strategy_value = form_factor.lower().strip()
+    if strategy_value not in {"mobile", "desktop"}:
+        return "Invalid form_factor. Use 'mobile' or 'desktop'."
+
+    selected_categories = []
+    for raw in categories.split(","):
+        category = raw.strip().lower()
+        if not category:
+            continue
+        if category not in LIGHTHOUSE_CATEGORIES:
+            return f"Invalid Lighthouse category '{category}'. Allowed: {', '.join(sorted(LIGHTHOUSE_CATEGORIES))}"
+        selected_categories.append(category)
+    if not selected_categories:
+        selected_categories = ["performance", "seo"]
+
+    npx_path = shutil.which("npx")
+    if not npx_path:
+        return "npx is not available. Install Node.js to use the local Lighthouse audit."
+
+    command = [
+        npx_path,
+        "--yes",
+        "lighthouse",
+        normalized_url,
+        "--output=json",
+        "--output-path=stdout",
+        "--quiet",
+        f"--only-categories={','.join(selected_categories)}",
+        "--chrome-flags=--headless=new --no-sandbox --disable-gpu",
+    ]
+    if strategy_value == "desktop":
+        command.append("--preset=desktop")
+    if LIGHTHOUSE_CHROME_PATH:
+        command.append(f"--chrome-path={LIGHTHOUSE_CHROME_PATH}")
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            if not stderr and result.stdout:
+                stderr = result.stdout.strip()
+            return (
+                "Local Lighthouse failed. "
+                f"Exit code: {result.returncode}. "
+                f"Details: {_clip(stderr or 'No stderr output', 400)}"
+            )
+
+        payload = json.loads(result.stdout)
+        return _summarize_lighthouse_payload(payload, f"Local Lighthouse audit for {normalized_url} ({strategy_value})")
+    except subprocess.TimeoutExpired:
+        return "Local Lighthouse timed out after 180 seconds."
+    except json.JSONDecodeError:
+        return "Local Lighthouse returned invalid JSON output."
+    except Exception as exc:
+        return f"Error running local Lighthouse: {str(exc)}"
+
+
+@mcp.tool()
+async def inspect_robots_txt(url_or_origin: str) -> str:
+    """
+    Fetch and summarize the site's robots.txt file.
+
+    Args:
+        url_or_origin: Full URL, origin, or sc-domain property
+    """
+    robots_url = _origin_from_url(url_or_origin).rstrip("/") + "/robots.txt"
+    try:
+        response = await _fetch_url(robots_url)
+        if response.status_code == 404:
+            return (
+                f"robots.txt not found at {robots_url} (HTTP 404).\n"
+                "Google treats a missing robots.txt as no crawl restrictions."
+            )
+
+        text = response.text
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        sitemap_urls = []
+        wildcard_disallows = []
+        wildcard_allows = []
+        warnings = []
+        applies_to_wildcard = False
+
+        for raw_line in lines:
+            line = raw_line.split("#", 1)[0].strip()
+            if not line or ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            key = key.strip().lower()
+            value = value.strip()
+            if key == "user-agent":
+                applies_to_wildcard = value.lower() == "*"
+            elif key == "disallow" and applies_to_wildcard:
+                wildcard_disallows.append(value)
+            elif key == "allow" and applies_to_wildcard:
+                wildcard_allows.append(value)
+            elif key == "sitemap":
+                sitemap_urls.append(value)
+            elif key == "noindex":
+                warnings.append("Found noindex directive in robots.txt. Google no longer supports this.")
+
+        blocked_all = any(path == "/" for path in wildcard_disallows)
+        output = [
+            f"robots.txt inspection for {robots_url}",
+            f"HTTP status: {response.status_code}",
+            f"User-agent * disallow rules: {len(wildcard_disallows)}",
+            f"User-agent * allow rules: {len(wildcard_allows)}",
+            f"Blocks all crawling for user-agent *: {'YES' if blocked_all else 'NO'}",
+        ]
+
+        if sitemap_urls:
+            output.append("Declared sitemap URLs:")
+            for item in sitemap_urls[:10]:
+                output.append(f"  {item}")
+        else:
+            output.append("No sitemap directive found in robots.txt.")
+
+        if wildcard_disallows:
+            output.append("Sample disallow rules for user-agent *:")
+            for item in wildcard_disallows[:10]:
+                output.append(f"  {item or '[blank]'}")
+
+        if warnings:
+            output.append("Warnings:")
+            for warning in warnings:
+                output.append(f"  {warning}")
+
+        return "\n".join(output)
+    except Exception as exc:
+        return f"Error inspecting robots.txt: {str(exc)}"
+
+
+@mcp.tool()
+async def analyze_sitemap(sitemap_url: str, sample_urls: int = 5) -> str:
+    """
+    Fetch and analyze an XML sitemap or sitemap index.
+
+    Args:
+        sitemap_url: Full sitemap URL
+        sample_urls: Number of sitemap URLs to validate with GET requests
+    """
+    normalized_url = _ensure_https_url(sitemap_url)
+    try:
+        response = await _fetch_url(normalized_url, headers={"Accept": "application/xml,text/xml;q=0.9,*/*;q=0.5"})
+        response.raise_for_status()
+        xml_text = _extract_xml_text(response)
+        parsed = _parse_sitemap_document(xml_text)
+
+        lines = [f"Sitemap analysis for {normalized_url}", f"Detected type: {parsed['type']}"]
+
+        if parsed["type"] == "sitemapindex":
+            sitemaps = parsed["sitemaps"]
+            lines.append(f"Nested sitemaps: {len(sitemaps)}")
+            for item in sitemaps[:10]:
+                lines.append(f"  {item}")
+            return "\n".join(lines)
+
+        urls = parsed["urls"]
+        lines.append(f"URLs listed: {len(urls)}")
+        lastmod_count = parsed.get("lastmod_count", 0)
+        lines.append(f"URLs with lastmod: {lastmod_count}")
+        if urls:
+            lines.append("Sample URLs:")
+            for item in urls[:10]:
+                lines.append(f"  {item['loc']}")
+
+        sample_results = []
+        for item in urls[: max(0, min(sample_urls, len(urls)))]:
+            target = item["loc"]
+            try:
+                sample_response = await _fetch_url(target, method="GET")
+                sample_results.append((target, sample_response.status_code))
+            except Exception:
+                sample_results.append((target, "ERROR"))
+
+        if sample_results:
+            lines.append("Sample URL status checks:")
+            for target, status in sample_results:
+                lines.append(f"  {target} -> {status}")
+
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"Error analyzing sitemap: {str(exc)}"
+
+
+@mcp.tool()
+async def analyze_page_seo(url: str) -> str:
+    """
+    Fetch a page and analyze on-page SEO signals, structured data, and indexability hints.
+
+    Args:
+        url: Full page URL
+    """
+    normalized_url = _ensure_https_url(url)
+    try:
+        response = await _fetch_url(normalized_url)
+        content_type = response.headers.get("content-type", "").lower()
+        final_url = str(response.url)
+        if "html" not in content_type and "xml" not in content_type and "<html" not in response.text[:500].lower():
+            return (
+                f"Page SEO analysis for {normalized_url}\n"
+                f"Final URL: {final_url}\n"
+                f"HTTP status: {response.status_code}\n"
+                f"Content-Type: {content_type or 'unknown'}\n"
+                "Response is not HTML, so on-page SEO analysis was skipped."
+            )
+
+        analysis = _analyze_html_document(final_url, response.status_code, dict(response.headers), response.text)
+        lines = [
+            f"Page SEO analysis for {normalized_url}",
+            f"Final URL: {final_url}",
+            f"HTTP status: {response.status_code} ({_status_class(response.status_code)})",
+            f"Title: {_clip(analysis['title'] or '[missing]', 120)}",
+            f"Meta description: {_clip(analysis['meta_description'] or '[missing]', 180)}",
+            f"Canonical: {_clip(analysis['canonicals'][0], 120) if analysis['canonicals'] else '[missing]'}",
+            f"H1 count: {len(analysis['headings']['h1'])}",
+            f"H2 count: {len(analysis['headings']['h2'])}",
+            f"Word count: {analysis['body_word_count']}",
+            f"Structured data types: {', '.join(analysis['structured_types']) if analysis['structured_types'] else '[none found]'}",
+            f"Hreflang count: {len(analysis['hreflangs'])}",
+        ]
+
+        if analysis["issues"]:
+            lines.append("Issues:")
+            for issue in analysis["issues"]:
+                lines.append(f"  {issue}")
+        if analysis["notes"]:
+            lines.append("Notes:")
+            for note in analysis["notes"]:
+                lines.append(f"  {note}")
+        if analysis["headings"]["h1"]:
+            lines.append("H1 text:")
+            for heading in analysis["headings"]["h1"][:3]:
+                lines.append(f"  {heading}")
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"Error analyzing page SEO: {str(exc)}"
+
+
+@mcp.tool()
+async def crawl_site_seo(start_url: str, max_pages: int = 10) -> str:
+    """
+    Crawl a site from a start URL and aggregate common technical/on-page SEO issues.
+
+    Args:
+        start_url: First URL to crawl
+        max_pages: Maximum number of same-origin HTML pages to crawl
+    """
+    normalized_start = _ensure_https_url(start_url)
+    origin = _origin_from_url(normalized_start)
+    queue = deque([normalized_start])
+    visited: Set[str] = set()
+    page_summaries = []
+    duplicate_titles: Counter[str] = Counter()
+    duplicate_descriptions: Counter[str] = Counter()
+
+    while queue and len(visited) < max_pages:
+        current = queue.popleft()
+        if current in visited:
+            continue
+        visited.add(current)
+
+        try:
+            response = await _fetch_url(current)
+            final_url = str(response.url)
+            content_type = response.headers.get("content-type", "").lower()
+            if "html" not in content_type and "<html" not in response.text[:500].lower():
+                page_summaries.append({
+                    "url": final_url,
+                    "status": response.status_code,
+                    "issues": [f"Non-HTML response ({content_type or 'unknown content type'})"],
+                    "title": "",
+                    "description": "",
+                })
+                continue
+
+            analysis = _analyze_html_document(final_url, response.status_code, dict(response.headers), response.text)
+            page_summaries.append({
+                "url": final_url,
+                "status": response.status_code,
+                "issues": analysis["issues"],
+                "notes": analysis["notes"],
+                "title": analysis["title"],
+                "description": analysis["meta_description"],
+            })
+
+            if analysis["title"]:
+                duplicate_titles[analysis["title"]] += 1
+            if analysis["meta_description"]:
+                duplicate_descriptions[analysis["meta_description"]] += 1
+
+            for discovered in _iter_internal_links(final_url, response.text):
+                if discovered.startswith(origin) and discovered not in visited and discovered not in queue and len(visited) + len(queue) < max_pages * 3:
+                    queue.append(discovered)
+        except Exception as exc:
+            page_summaries.append({
+                "url": current,
+                "status": "ERROR",
+                "issues": [f"Fetch error: {str(exc)}"],
+                "title": "",
+                "description": "",
+            })
+
+    missing_titles = [page["url"] for page in page_summaries if "Missing <title>" in page.get("issues", [])]
+    missing_descriptions = [page["url"] for page in page_summaries if "Missing meta description" in page.get("issues", [])]
+    noindex_pages = [page["url"] for page in page_summaries if "Page is explicitly marked noindex" in page.get("issues", [])]
+    duplicate_title_items = [(title, count) for title, count in duplicate_titles.items() if title and count > 1]
+    duplicate_description_items = [(desc, count) for desc, count in duplicate_descriptions.items() if desc and count > 1]
+
+    lines = [
+        f"Crawl SEO audit for {normalized_start}",
+        f"Origin: {origin}",
+        f"Pages crawled: {len(page_summaries)} / {max_pages}",
+        f"Pages missing title: {len(missing_titles)}",
+        f"Pages missing meta description: {len(missing_descriptions)}",
+        f"Pages marked noindex: {len(noindex_pages)}",
+        f"Duplicate titles: {len(duplicate_title_items)}",
+        f"Duplicate meta descriptions: {len(duplicate_description_items)}",
+    ]
+
+    if missing_titles:
+        lines.append("Missing titles:")
+        for item in missing_titles[:10]:
+            lines.append(f"  {item}")
+    if missing_descriptions:
+        lines.append("Missing meta descriptions:")
+        for item in missing_descriptions[:10]:
+            lines.append(f"  {item}")
+    if noindex_pages:
+        lines.append("Noindex pages:")
+        for item in noindex_pages[:10]:
+            lines.append(f"  {item}")
+    if duplicate_title_items:
+        lines.append("Duplicate titles:")
+        for title, count in duplicate_title_items[:10]:
+            lines.append(f"  {count} pages -> {_clip(title, 120)}")
+    if duplicate_description_items:
+        lines.append("Duplicate meta descriptions:")
+        for description, count in duplicate_description_items[:10]:
+            lines.append(f"  {count} pages -> {_clip(description, 140)}")
+
+    issue_pages = [page for page in page_summaries if page.get("issues")]
+    if issue_pages:
+        lines.append("Pages with issues:")
+        for page in issue_pages[:10]:
+            lines.append(f"  {page['url']} -> {', '.join(page['issues'])}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def audit_live_site(url: str, crawl_pages: int = 5, include_lighthouse: bool = False) -> str:
+    """
+    Run a live SEO audit without requiring Search Console access.
+    Combines page analysis, robots.txt inspection, sitemap discovery, PSI data, and a small same-origin crawl.
+
+    Args:
+        url: Full site/page URL
+        crawl_pages: Number of pages to crawl for duplicate/missing-tag issues
+        include_lighthouse: Whether to also run a local Lighthouse CLI audit
+    """
+    normalized_url = _ensure_https_url(url)
+    origin = _origin_from_url(normalized_url)
+    lines = [f"Live SEO audit for {normalized_url}", "=" * 80]
+
+    lines.append(await analyze_page_seo(normalized_url))
+    lines.append("\n" + "-" * 80)
+    lines.append(await inspect_robots_txt(origin))
+    lines.append("\n" + "-" * 80)
+
+    robots_url = origin.rstrip("/") + "/robots.txt"
+    discovered_sitemap = None
+    try:
+        robots_response = await _fetch_url(robots_url)
+        for raw_line in robots_response.text.splitlines():
+            line = raw_line.split("#", 1)[0].strip()
+            if line.lower().startswith("sitemap:"):
+                discovered_sitemap = line.split(":", 1)[1].strip()
+                break
+    except Exception:
+        discovered_sitemap = None
+
+    if discovered_sitemap:
+        lines.append(await analyze_sitemap(discovered_sitemap, sample_urls=3))
+    else:
+        lines.append("No sitemap discovered via robots.txt.")
+    lines.append("\n" + "-" * 80)
+
+    lines.append(await get_pagespeed_insights(normalized_url))
+    lines.append("\n" + "-" * 80)
+    lines.append(await crawl_site_seo(normalized_url, max_pages=max(1, min(crawl_pages, 25))))
+
+    if include_lighthouse:
+        lines.append("\n" + "-" * 80)
+        lines.append(await run_lighthouse_audit(normalized_url))
+
+    lines.append("\n" + "=" * 80)
+    return "\n".join(lines)
+
 
 @mcp.tool()
 async def find_striking_distance_keywords(site_url: str, days: int = 28, min_impressions: int = 10, row_limit: int = 50) -> str:
