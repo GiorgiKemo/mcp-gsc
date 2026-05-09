@@ -25,6 +25,8 @@ import gzip
 import re
 import shutil
 import subprocess
+import ipaddress
+import socket
 import xml.etree.ElementTree as ET
 from collections import Counter, deque
 from html import unescape
@@ -99,6 +101,17 @@ DEFAULT_FETCH_HEADERS = {
 }
 DEFAULT_FETCH_TIMEOUT = httpx.Timeout(connect=10.0, read=20.0, write=20.0, pool=20.0)
 LIGHTHOUSE_CATEGORIES = {"performance", "accessibility", "best-practices", "seo", "pwa"}
+SEO_SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+FETCH_ALLOWED_SCHEMES = {"http", "https"}
+MAX_FETCH_BYTES = int(os.environ.get("SEO_AUDIT_MAX_FETCH_BYTES", str(5 * 1024 * 1024)))
+MAX_REDIRECTS = int(os.environ.get("SEO_AUDIT_MAX_REDIRECTS", "5"))
+MAX_SITEMAP_URLS = int(os.environ.get("SEO_AUDIT_MAX_SITEMAP_URLS", "50000"))
+MAX_CRAWL_PAGES = int(os.environ.get("SEO_AUDIT_MAX_CRAWL_PAGES", "100"))
+ALLOW_PRIVATE_URLS = os.environ.get("SEO_AUDIT_ALLOW_PRIVATE_URLS", "").lower() in ("true", "1", "yes")
+ENABLE_WRITE_TOOLS = os.environ.get("SEO_AUDIT_ENABLE_WRITE_TOOLS", "").lower() in ("true", "1", "yes")
+ALLOW_NPX_LIGHTHOUSE = os.environ.get("SEO_AUDIT_ALLOW_NPX_LIGHTHOUSE", "").lower() in ("true", "1", "yes")
+LIGHTHOUSE_BINARY = os.environ.get("LIGHTHOUSE_BINARY", "")
+LIGHTHOUSE_NO_SANDBOX = os.environ.get("LIGHTHOUSE_NO_SANDBOX", "").lower() in ("true", "1", "yes")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Authentication helpers
@@ -293,6 +306,179 @@ def _status_class(status_code: int) -> str:
     return "unknown"
 
 
+def _host_is_local_or_private(hostname: str) -> bool:
+    host = (hostname or "").strip().lower()
+    if not host:
+        return False
+    host = host.strip("[]")
+    if host == "localhost" or host.endswith(".local"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+    except ValueError:
+        return False
+
+
+def _url_is_local_or_private(url: str) -> bool:
+    return _host_is_local_or_private(urlparse(url).hostname or "")
+
+
+def _hostname_resolves_to_local_or_private(hostname: str) -> bool:
+    host = (hostname or "").strip().strip("[]")
+    if not host:
+        return False
+    if _host_is_local_or_private(host):
+        return True
+    try:
+        resolved = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except socket.gaierror:
+        return False
+    for family, _, _, _, sockaddr in resolved:
+        address = sockaddr[0]
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            continue
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            return True
+    return False
+
+
+def _validate_fetchable_public_url(url: str) -> str:
+    normalized = _ensure_https_url(url)
+    parsed = urlparse(normalized)
+    if parsed.scheme not in FETCH_ALLOWED_SCHEMES:
+        raise ValueError("Only http and https URLs can be fetched by public SEO audit tools.")
+    if not parsed.netloc:
+        raise ValueError("A valid URL host is required.")
+    if "@" in parsed.netloc:
+        raise ValueError("URLs with embedded credentials are not allowed.")
+    if not ALLOW_PRIVATE_URLS and _hostname_resolves_to_local_or_private(parsed.hostname or ""):
+        raise ValueError(
+            "Private, loopback, local, and reserved network targets are blocked by default. "
+            "Set SEO_AUDIT_ALLOW_PRIVATE_URLS=true only for trusted local testing."
+        )
+    return normalized
+
+
+def _write_tools_disabled(action: str) -> str:
+    return (
+        f"Write tool disabled: {action}. "
+        "Set SEO_AUDIT_ENABLE_WRITE_TOOLS=true only when you intentionally want this MCP server "
+        "to mutate Google Search Console or Indexing API state."
+    )
+
+
+def _require_write_tools_enabled(action: str) -> Optional[str]:
+    if ENABLE_WRITE_TOOLS:
+        return None
+    return _write_tools_disabled(action)
+
+
+def _build_visible_content_soup(html: str) -> BeautifulSoup:
+    visible_soup = BeautifulSoup(html, "html.parser")
+    for tag_name in ("script", "style", "noscript", "template"):
+        for tag in visible_soup.find_all(tag_name):
+            tag.decompose()
+    return visible_soup
+
+
+def _seo_findings_from_analysis(analysis: Dict[str, Any]) -> List[Tuple[str, str]]:
+    findings: List[Tuple[int, str, str]] = []
+    seen: Set[str] = set()
+
+    def add(severity: str, message: str) -> None:
+        key = f"{severity}:{message}"
+        if key in seen:
+            return
+        seen.add(key)
+        findings.append((SEO_SEVERITY_ORDER[severity], severity, message))
+
+    for issue in analysis.get("issues", []):
+        if issue.startswith("HTTP status"):
+            add("critical", issue)
+        elif issue == "Missing <title>":
+            add("high", issue)
+        elif issue == "Multiple canonical tags found":
+            add("high", issue)
+        elif issue == "Page is explicitly marked noindex":
+            add("high", issue)
+        elif issue == "Page instructs crawlers not to follow links":
+            add("high", issue)
+        elif issue.startswith("Invalid JSON-LD"):
+            add("medium", issue)
+        elif issue.startswith("Images missing alt text"):
+            add("medium", issue)
+        elif issue.startswith("Anchors without href"):
+            add("medium", issue)
+        elif issue.startswith("Canonical URL"):
+            add("medium", issue)
+        elif issue in {"Missing meta description", "Missing H1", "No visible body content", "Missing viewport meta tag"}:
+            add("medium", issue)
+        else:
+            add("medium", issue)
+
+    for note in analysis.get("notes", []):
+        if note.startswith("Canonical points to another host") or note == "No canonical tag found":
+            add("medium", note)
+        elif note.startswith("Canonical URL uses http"):
+            add("medium", note)
+        elif (
+            note.startswith("Multiple H1 tags found")
+            or note.startswith("Thin visible content")
+            or note.startswith("Images with empty alt")
+            or note.startswith("Links with empty anchor text")
+        ):
+            add("low", note)
+        elif (
+            note.startswith("Title is ")
+            or note.startswith("Meta description is ")
+            or note.startswith("Missing og:")
+            or note.startswith("Missing twitter:")
+            or note.startswith("Missing html lang")
+            or note.startswith("Meta keywords")
+            or note.startswith("Images missing width")
+            or note.startswith("Page limits search result snippets")
+            or note.endswith("elements use data-nosnippet")
+        ):
+            add("low", note)
+
+    findings.sort(key=lambda item: (item[0], item[2]))
+    return [(severity, message) for _, severity, message in findings]
+
+
+def _summarize_priority_findings(findings: List[Tuple[str, str]], limit: int = 8) -> List[str]:
+    if not findings:
+        return ["Priority findings: none"]
+    lines = ["Priority findings:"]
+    for severity, message in findings[:limit]:
+        lines.append(f"  [{severity.upper()}] {message}")
+    return lines
+
+
+def _is_runtime_pagespeed_failure(result: str) -> bool:
+    return result.startswith("PageSpeed Insights error") or result.startswith("Error running PageSpeed Insights")
+
+
+def _is_runtime_lighthouse_failure(result: str) -> bool:
+    return (
+        result.startswith("Local Lighthouse failed")
+        or result.startswith("Local Lighthouse timed out")
+        or result.startswith("Local Lighthouse blocked URL")
+        or result.startswith("Local Lighthouse returned invalid JSON output")
+        or result.startswith("Error running local Lighthouse")
+        or result.startswith("No Lighthouse runner available")
+    )
+
+
+async def _build_lighthouse_fallback(url: str, strategy: str, categories: str, reason: str) -> str:
+    lighthouse_result = await run_lighthouse_audit(url, form_factor=strategy, categories=categories)
+    if _is_runtime_lighthouse_failure(lighthouse_result):
+        return reason
+    return f"{reason}\nLocal Lighthouse fallback:\n{lighthouse_result}"
+
+
 def _canonicalize_crawl_url(base_url: str, href: str) -> Optional[str]:
     if not href:
         return None
@@ -315,12 +501,52 @@ async def _fetch_url(
         request_headers.update(headers)
 
     async with httpx.AsyncClient(
-        follow_redirects=follow_redirects,
+        follow_redirects=False,
         timeout=DEFAULT_FETCH_TIMEOUT,
         headers=request_headers,
     ) as client:
-        response = await client.request(method, url)
-        return response
+        current_url = _validate_fetchable_public_url(url)
+        redirects_followed = 0
+
+        while True:
+            request = client.build_request(method, current_url)
+            response = await client.send(request, stream=True)
+            try:
+                if follow_redirects and response.is_redirect:
+                    if redirects_followed >= MAX_REDIRECTS:
+                        raise ValueError(f"Too many redirects while fetching {url}.")
+                    location = response.headers.get("location")
+                    if not location:
+                        return httpx.Response(
+                            response.status_code,
+                            headers=response.headers,
+                            content=b"",
+                            request=response.request,
+                            extensions=response.extensions,
+                        )
+                    current_url = _validate_fetchable_public_url(urljoin(str(response.url), location))
+                    redirects_followed += 1
+                    continue
+
+                chunks = []
+                total = 0
+                async for chunk in response.aiter_bytes():
+                    total += len(chunk)
+                    if total > MAX_FETCH_BYTES:
+                        raise ValueError(
+                            f"Response exceeded SEO_AUDIT_MAX_FETCH_BYTES ({MAX_FETCH_BYTES} bytes)."
+                        )
+                    chunks.append(chunk)
+
+                return httpx.Response(
+                    response.status_code,
+                    headers=response.headers,
+                    content=b"".join(chunks),
+                    request=response.request,
+                    extensions=response.extensions,
+                )
+            finally:
+                await response.aclose()
 
 
 def _extract_json_ld_types(value: Any, types: Set[str]) -> None:
@@ -361,6 +587,26 @@ def _parse_json_ld_types(soup: BeautifulSoup) -> List[str]:
     return sorted(discovered)
 
 
+def _count_invalid_json_ld_scripts(soup: BeautifulSoup) -> int:
+    invalid = 0
+    for script in soup.find_all("script"):
+        script_type = (script.get("type") or "").lower()
+        if "ld+json" not in script_type:
+            continue
+        raw = (script.string or script.get_text(" ", strip=True) or "").strip()
+        if not raw:
+            continue
+        try:
+            json.loads(raw)
+        except json.JSONDecodeError:
+            cleaned = raw.replace("<!--", "").replace("-->", "").strip()
+            try:
+                json.loads(cleaned)
+            except Exception:
+                invalid += 1
+    return invalid
+
+
 def _parse_meta_tags(soup: BeautifulSoup) -> Dict[str, str]:
     meta: Dict[str, str] = {}
     for tag in soup.find_all("meta"):
@@ -373,7 +619,10 @@ def _parse_meta_tags(soup: BeautifulSoup) -> Dict[str, str]:
 
 def _analyze_html_document(final_url: str, status_code: int, headers: Dict[str, str], html: str) -> Dict[str, Any]:
     soup = BeautifulSoup(html, "html.parser")
+    visible_soup = _build_visible_content_soup(html)
     meta = _parse_meta_tags(soup)
+    html_tag = soup.find("html")
+    html_lang = _clean_text(html_tag.get("lang")) if html_tag else ""
 
     title_text = _clean_text(soup.title.get_text(" ", strip=True) if soup.title else "")
     canonical_tags = []
@@ -393,15 +642,53 @@ def _analyze_html_document(final_url: str, status_code: int, headers: Dict[str, 
             hreflangs.append((hreflang, href))
 
     headings = {
-        "h1": [_clean_text(tag.get_text(" ", strip=True)) for tag in soup.find_all("h1") if _clean_text(tag.get_text(" ", strip=True))],
-        "h2": [_clean_text(tag.get_text(" ", strip=True)) for tag in soup.find_all("h2") if _clean_text(tag.get_text(" ", strip=True))],
+        "h1": [_clean_text(tag.get_text(" ", strip=True)) for tag in visible_soup.find_all("h1") if _clean_text(tag.get_text(" ", strip=True))],
+        "h2": [_clean_text(tag.get_text(" ", strip=True)) for tag in visible_soup.find_all("h2") if _clean_text(tag.get_text(" ", strip=True))],
     }
 
-    body_text = _clean_text(soup.get_text(" ", strip=True))
+    body_text = _clean_text(visible_soup.get_text(" ", strip=True))
     structured_types = _parse_json_ld_types(soup)
+    invalid_json_ld_count = _count_invalid_json_ld_scripts(soup)
     x_robots = _clean_text(headers.get("x-robots-tag", ""))
     robots_meta = meta.get("robots", "")
     googlebot_meta = meta.get("googlebot", "")
+    viewport_meta = meta.get("viewport", "")
+    meta_keywords = meta.get("keywords", "")
+    data_nosnippet_count = len(visible_soup.select("[data-nosnippet]"))
+    images = visible_soup.find_all("img")
+    images_missing_alt = []
+    images_empty_alt = []
+    images_without_size = []
+    for image in images:
+        src = _clean_text(image.get("src") or image.get("data-src") or image.get("srcset") or "[inline image]")
+        if not image.has_attr("alt"):
+            images_missing_alt.append(src)
+        elif not _clean_text(image.get("alt")):
+            images_empty_alt.append(src)
+        if not image.get("width") or not image.get("height"):
+            images_without_size.append(src)
+
+    anchors = visible_soup.find_all("a")
+    anchors_missing_href = []
+    anchors_empty_text = []
+    internal_links = 0
+    external_links = 0
+    final_origin = _origin_from_url(final_url)
+    for anchor in anchors:
+        href = _clean_text(anchor.get("href"))
+        text = _clean_text(anchor.get_text(" ", strip=True) or anchor.get("aria-label") or anchor.get("title"))
+        if not href:
+            anchors_missing_href.append(text or "[empty anchor]")
+            continue
+        normalized_href = _canonicalize_crawl_url(final_url, href)
+        if normalized_href:
+            if normalized_href.startswith(final_origin):
+                internal_links += 1
+            else:
+                external_links += 1
+        if not text:
+            anchors_empty_text.append(href)
+
     issues: List[str] = []
     notes: List[str] = []
 
@@ -426,7 +713,19 @@ def _analyze_html_document(final_url: str, status_code: int, headers: Dict[str, 
         issues.append("Multiple canonical tags found")
     if canonical_tags:
         canonical_url = canonical_tags[0]
-        if urlparse(canonical_url).netloc and urlparse(canonical_url).netloc != urlparse(final_url).netloc:
+        parsed_canonical = urlparse(canonical_url)
+        parsed_final = urlparse(final_url)
+        if not parsed_canonical.scheme or not parsed_canonical.netloc:
+            issues.append("Canonical URL is not absolute")
+        if parsed_canonical.fragment:
+            issues.append("Canonical URL contains a fragment")
+        if parsed_final.scheme == "https" and parsed_canonical.scheme == "http":
+            notes.append("Canonical URL uses http on an https page")
+        if (
+            parsed_canonical.netloc
+            and parsed_canonical.netloc != parsed_final.netloc
+            and not _url_is_local_or_private(final_url)
+        ):
             notes.append(f"Canonical points to another host: {canonical_url}")
     else:
         notes.append("No canonical tag found")
@@ -434,11 +733,41 @@ def _analyze_html_document(final_url: str, status_code: int, headers: Dict[str, 
     indexability_signals = " | ".join(part for part in [robots_meta, googlebot_meta, x_robots] if part).lower()
     if "noindex" in indexability_signals:
         issues.append("Page is explicitly marked noindex")
+    if "nofollow" in indexability_signals:
+        issues.append("Page instructs crawlers not to follow links")
+    if "nosnippet" in indexability_signals:
+        notes.append("Page limits search result snippets with nosnippet")
 
     if not headings["h1"]:
         issues.append("Missing H1")
     elif len(headings["h1"]) > 1:
         notes.append(f"Multiple H1 tags found ({len(headings['h1'])})")
+
+    if not body_text:
+        issues.append("No visible body content")
+    elif len(body_text.split()) < 80:
+        notes.append(f"Thin visible content ({len(body_text.split())} words)")
+
+    if not viewport_meta:
+        issues.append("Missing viewport meta tag")
+    if not html_lang:
+        notes.append("Missing html lang attribute")
+    if meta_keywords:
+        notes.append("Meta keywords tag is present; Google Search ignores it")
+    if data_nosnippet_count:
+        notes.append(f"{data_nosnippet_count} elements use data-nosnippet")
+    if invalid_json_ld_count:
+        issues.append(f"Invalid JSON-LD scripts found ({invalid_json_ld_count})")
+    if images_missing_alt:
+        issues.append(f"Images missing alt text ({len(images_missing_alt)})")
+    if images_empty_alt:
+        notes.append(f"Images with empty alt text ({len(images_empty_alt)})")
+    if images_without_size:
+        notes.append(f"Images missing width or height attributes ({len(images_without_size)})")
+    if anchors_missing_href:
+        issues.append(f"Anchors without href are not crawlable ({len(anchors_missing_href)})")
+    if anchors_empty_text:
+        notes.append(f"Links with empty anchor text ({len(anchors_empty_text)})")
 
     if not meta.get("og:title"):
         notes.append("Missing og:title")
@@ -458,9 +787,25 @@ def _analyze_html_document(final_url: str, status_code: int, headers: Dict[str, 
         "headings": headings,
         "structured_types": structured_types,
         "x_robots_tag": x_robots,
+        "viewport": viewport_meta,
+        "html_lang": html_lang,
         "issues": issues,
         "notes": notes,
         "body_word_count": len(body_text.split()) if body_text else 0,
+        "images": {
+            "total": len(images),
+            "missing_alt": images_missing_alt,
+            "empty_alt": images_empty_alt,
+            "missing_size": images_without_size,
+        },
+        "links": {
+            "total": len(anchors),
+            "internal": internal_links,
+            "external": external_links,
+            "missing_href": anchors_missing_href,
+            "empty_text": anchors_empty_text,
+        },
+        "invalid_json_ld_count": invalid_json_ld_count,
     }
 
 
@@ -506,6 +851,8 @@ def _parse_sitemap_document(xml_text: str) -> Dict[str, Any]:
         for node in root.findall(".//"):
             if _local_name(node.tag) == "loc" and node.text:
                 sitemaps.append(node.text.strip())
+                if len(sitemaps) >= MAX_SITEMAP_URLS:
+                    break
         return {"type": "sitemapindex", "sitemaps": sitemaps, "urls": []}
 
     if root_name == "urlset":
@@ -525,6 +872,8 @@ def _parse_sitemap_document(xml_text: str) -> Dict[str, Any]:
                     urls.append({"loc": loc, "lastmod": lastmod})
                     if lastmod:
                         lastmods += 1
+                    if len(urls) >= MAX_SITEMAP_URLS:
+                        break
         return {"type": "urlset", "sitemaps": [], "urls": urls, "lastmod_count": lastmods}
 
     raise ValueError(f"Unsupported sitemap root element: {root_name}")
@@ -634,6 +983,9 @@ async def add_site(site_url: str) -> str:
     Args:
         site_url: The URL of the site to add (e.g. https://example.com or sc-domain:example.com)
     """
+    gate = _require_write_tools_enabled("add Search Console property")
+    if gate:
+        return gate
     try:
         service = get_gsc_service()
         service.sites().add(siteUrl=site_url).execute()
@@ -655,6 +1007,9 @@ async def delete_site(site_url: str) -> str:
     Args:
         site_url: The URL of the site to remove
     """
+    gate = _require_write_tools_enabled("delete Search Console property")
+    if gate:
+        return gate
     try:
         service = get_gsc_service()
         service.sites().delete(siteUrl=site_url).execute()
@@ -1237,6 +1592,9 @@ async def submit_sitemap(site_url: str, sitemap_url: str) -> str:
         site_url: Exact GSC property URL
         sitemap_url: Full URL of the sitemap to submit
     """
+    gate = _require_write_tools_enabled("submit sitemap")
+    if gate:
+        return gate
     try:
         service = get_gsc_service()
         service.sitemaps().submit(siteUrl=site_url, feedpath=sitemap_url).execute()
@@ -1254,6 +1612,9 @@ async def delete_sitemap(site_url: str, sitemap_url: str) -> str:
         site_url: Exact GSC property URL
         sitemap_url: Full URL of the sitemap to delete
     """
+    gate = _require_write_tools_enabled("delete sitemap")
+    if gate:
+        return gate
     try:
         service = get_gsc_service()
         service.sitemaps().delete(siteUrl=site_url, feedpath=sitemap_url).execute()
@@ -1276,6 +1637,9 @@ async def request_indexing(url: str) -> str:
     Args:
         url: The full URL to request indexing for
     """
+    gate = _require_write_tools_enabled("request indexing")
+    if gate:
+        return gate
     try:
         service = get_indexing_service()
         response = service.urlNotifications().publish(
@@ -1308,6 +1672,9 @@ async def request_removal(url: str) -> str:
     Args:
         url: The full URL to request removal for
     """
+    gate = _require_write_tools_enabled("request URL removal")
+    if gate:
+        return gate
     try:
         service = get_indexing_service()
         response = service.urlNotifications().publish(
@@ -1334,6 +1701,9 @@ async def batch_request_indexing(urls: str) -> str:
     Args:
         urls: List of URLs to index, one per line (max 100 per batch)
     """
+    gate = _require_write_tools_enabled("batch request indexing")
+    if gate:
+        return gate
     try:
         service = get_indexing_service()
         url_list = [u.strip() for u in urls.split("\n") if u.strip()]
@@ -1444,27 +1814,31 @@ async def get_core_web_vitals(url_or_origin: str, form_factor: str = "PHONE") ->
             "Get a free key at: https://console.cloud.google.com/apis/credentials\n"
             "Enable the 'Chrome UX Report API' in your Google Cloud project."
         )
-
-    import urllib.request
-    import urllib.error
+    form_factor_value = form_factor.upper().strip()
+    if form_factor_value not in {"PHONE", "DESKTOP", "TABLET"}:
+        return "Invalid form_factor. Use PHONE, DESKTOP, or TABLET."
 
     # Determine if it's a specific URL or an origin (no path beyond /)
-    body = {"formFactor": form_factor.upper()}
-    parsed = urlparse(url_or_origin)
+    normalized_url = _ensure_https_url(url_or_origin)
+    body = {"formFactor": form_factor_value}
+    parsed = urlparse(normalized_url)
     has_path = parsed.path not in ("", "/")
     if has_path:
-        body["url"] = url_or_origin
+        body["url"] = normalized_url
     else:
-        body["origin"] = url_or_origin.rstrip("/")
+        body["origin"] = _origin_from_url(normalized_url).rstrip("/")
 
     try:
-        req = urllib.request.Request(
-            f"https://chromeuxreport.googleapis.com/v1/records:queryRecord?key={CRUX_API_KEY}",
-            data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read())
+        async with httpx.AsyncClient(timeout=DEFAULT_FETCH_TIMEOUT, headers=DEFAULT_FETCH_HEADERS) as client:
+            response = await client.post(
+                "https://chromeuxreport.googleapis.com/v1/records:queryRecord",
+                params={"key": CRUX_API_KEY},
+                json=body,
+            )
+        if response.status_code == 404:
+            return f"No CrUX data available for {normalized_url}. The site may not have enough traffic for Chrome to collect data."
+        response.raise_for_status()
+        data = response.json()
 
         record = data.get("record", {})
         metrics = record.get("metrics", {})
@@ -1502,13 +1876,11 @@ async def get_core_web_vitals(url_or_origin: str, form_factor: str = "PHONE") ->
 
         return "\n".join(lines)
 
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return f"No CrUX data available for {url_or_origin}. The site may not have enough traffic for Chrome to collect data."
-        error_body = e.read().decode() if hasattr(e, 'read') else str(e)
+    except httpx.HTTPStatusError as e:
+        error_body = e.response.text
         # Strip API key from error messages to avoid leaking it
         safe_body = error_body.replace(CRUX_API_KEY, "[REDACTED]") if CRUX_API_KEY else error_body
-        return f"CrUX API error (HTTP {e.code}): {safe_body[:200]}"
+        return f"CrUX API error (HTTP {e.response.status_code}): {safe_body[:200]}"
     except Exception as e:
         return f"Error fetching Core Web Vitals: {str(e)}"
 
@@ -1580,9 +1952,19 @@ async def get_pagespeed_insights(
             )
         else:
             guidance = ""
-        return f"PageSpeed Insights error (HTTP {exc.response.status_code}): {safe_body}{guidance}"
+        return await _build_lighthouse_fallback(
+            normalized_url,
+            strategy_value,
+            ",".join(selected_categories),
+            f"PageSpeed Insights error (HTTP {exc.response.status_code}): {safe_body}{guidance}",
+        )
     except Exception as exc:
-        return f"Error running PageSpeed Insights: {str(exc)}"
+        return await _build_lighthouse_fallback(
+            normalized_url,
+            strategy_value,
+            ",".join(selected_categories),
+            f"Error running PageSpeed Insights: {str(exc)}",
+        )
 
 
 @mcp.tool()
@@ -1616,21 +1998,41 @@ async def run_lighthouse_audit(
     if not selected_categories:
         selected_categories = ["performance", "seo"]
 
-    npx_path = shutil.which("npx")
-    if not npx_path:
-        return "npx is not available. Install Node.js to use the local Lighthouse audit."
+    try:
+        normalized_url = _validate_fetchable_public_url(normalized_url)
+    except ValueError as exc:
+        return f"Local Lighthouse blocked URL: {str(exc)}"
+
+    lighthouse_runner = []
+    if LIGHTHOUSE_BINARY:
+        lighthouse_runner = [LIGHTHOUSE_BINARY]
+    else:
+        lighthouse_path = shutil.which("lighthouse")
+        if lighthouse_path:
+            lighthouse_runner = [lighthouse_path]
+        elif ALLOW_NPX_LIGHTHOUSE:
+            npx_path = shutil.which("npx")
+            if npx_path:
+                lighthouse_runner = [npx_path, "--yes", "lighthouse"]
+
+    if not lighthouse_runner:
+        return (
+            "No Lighthouse runner available. Install Lighthouse locally and set LIGHTHOUSE_BINARY, "
+            "or set SEO_AUDIT_ALLOW_NPX_LIGHTHOUSE=true to allow npx to download/run Lighthouse."
+        )
 
     command = [
-        npx_path,
-        "--yes",
-        "lighthouse",
+        *lighthouse_runner,
         normalized_url,
         "--output=json",
         "--output-path=stdout",
         "--quiet",
         f"--only-categories={','.join(selected_categories)}",
-        "--chrome-flags=--headless=new --no-sandbox --disable-gpu",
     ]
+    chrome_flags = ["--headless=new", "--disable-gpu"]
+    if LIGHTHOUSE_NO_SANDBOX:
+        chrome_flags.append("--no-sandbox")
+    command.append(f"--chrome-flags={' '.join(chrome_flags)}")
     if strategy_value == "desktop":
         command.append("--preset=desktop")
     if LIGHTHOUSE_CHROME_PATH:
@@ -1748,6 +2150,7 @@ async def analyze_sitemap(sitemap_url: str, sample_urls: int = 5) -> str:
         sample_urls: Number of sitemap URLs to validate with GET requests
     """
     normalized_url = _ensure_https_url(sitemap_url)
+    sample_urls = max(0, min(sample_urls, 25))
     try:
         response = await _fetch_url(normalized_url, headers={"Accept": "application/xml,text/xml;q=0.9,*/*;q=0.5"})
         response.raise_for_status()
@@ -1773,7 +2176,7 @@ async def analyze_sitemap(sitemap_url: str, sample_urls: int = 5) -> str:
                 lines.append(f"  {item['loc']}")
 
         sample_results = []
-        for item in urls[: max(0, min(sample_urls, len(urls)))]:
+        for item in urls[: min(sample_urls, len(urls))]:
             target = item["loc"]
             try:
                 sample_response = await _fetch_url(target, method="GET")
@@ -1814,6 +2217,7 @@ async def analyze_page_seo(url: str) -> str:
             )
 
         analysis = _analyze_html_document(final_url, response.status_code, dict(response.headers), response.text)
+        findings = _seo_findings_from_analysis(analysis)
         lines = [
             f"Page SEO analysis for {normalized_url}",
             f"Final URL: {final_url}",
@@ -1826,14 +2230,29 @@ async def analyze_page_seo(url: str) -> str:
             f"Word count: {analysis['body_word_count']}",
             f"Structured data types: {', '.join(analysis['structured_types']) if analysis['structured_types'] else '[none found]'}",
             f"Hreflang count: {len(analysis['hreflangs'])}",
+            f"HTML lang: {analysis['html_lang'] or '[missing]'}",
+            f"Viewport meta: {'present' if analysis['viewport'] else '[missing]'}",
+            (
+                "Images: "
+                f"{analysis['images']['total']} total, "
+                f"{len(analysis['images']['missing_alt'])} missing alt, "
+                f"{len(analysis['images']['empty_alt'])} empty alt"
+            ),
+            (
+                "Links: "
+                f"{analysis['links']['total']} total, "
+                f"{analysis['links']['internal']} internal, "
+                f"{analysis['links']['external']} external, "
+                f"{len(analysis['links']['missing_href'])} without href"
+            ),
         ]
-
+        lines.extend(_summarize_priority_findings(findings))
         if analysis["issues"]:
-            lines.append("Issues:")
+            lines.append("Detailed issues:")
             for issue in analysis["issues"]:
                 lines.append(f"  {issue}")
         if analysis["notes"]:
-            lines.append("Notes:")
+            lines.append("Detailed notes:")
             for note in analysis["notes"]:
                 lines.append(f"  {note}")
         if analysis["headings"]["h1"]:
@@ -1855,6 +2274,7 @@ async def crawl_site_seo(start_url: str, max_pages: int = 10) -> str:
         max_pages: Maximum number of same-origin HTML pages to crawl
     """
     normalized_start = _ensure_https_url(start_url)
+    max_pages = max(1, min(max_pages, MAX_CRAWL_PAGES))
     origin = _origin_from_url(normalized_start)
     queue = deque([normalized_start])
     visited: Set[str] = set()
@@ -1890,6 +2310,9 @@ async def crawl_site_seo(start_url: str, max_pages: int = 10) -> str:
                 "notes": analysis["notes"],
                 "title": analysis["title"],
                 "description": analysis["meta_description"],
+                "word_count": analysis["body_word_count"],
+                "images_missing_alt": len(analysis["images"]["missing_alt"]),
+                "links_missing_href": len(analysis["links"]["missing_href"]),
             })
 
             if analysis["title"]:
@@ -1907,13 +2330,39 @@ async def crawl_site_seo(start_url: str, max_pages: int = 10) -> str:
                 "issues": [f"Fetch error: {str(exc)}"],
                 "title": "",
                 "description": "",
+                "word_count": 0,
             })
 
     missing_titles = [page["url"] for page in page_summaries if "Missing <title>" in page.get("issues", [])]
     missing_descriptions = [page["url"] for page in page_summaries if "Missing meta description" in page.get("issues", [])]
     noindex_pages = [page["url"] for page in page_summaries if "Page is explicitly marked noindex" in page.get("issues", [])]
+    thin_content_pages = [page["url"] for page in page_summaries if page.get("word_count", 0) > 0 and page.get("word_count", 0) < 80]
     duplicate_title_items = [(title, count) for title, count in duplicate_titles.items() if title and count > 1]
     duplicate_description_items = [(desc, count) for desc, count in duplicate_descriptions.items() if desc and count > 1]
+    fetch_error_pages = [page["url"] for page in page_summaries if any(str(issue).startswith("Fetch error:") for issue in page.get("issues", []))]
+    pages_with_missing_image_alt = [page["url"] for page in page_summaries if page.get("images_missing_alt", 0) > 0]
+    pages_with_uncrawlable_anchors = [page["url"] for page in page_summaries if page.get("links_missing_href", 0) > 0]
+
+    crawl_findings: List[Tuple[str, str]] = []
+    if fetch_error_pages:
+        crawl_findings.append(("high", f"{len(fetch_error_pages)} crawled pages failed to fetch"))
+    if missing_titles:
+        crawl_findings.append(("high", f"{len(missing_titles)} pages are missing a title tag"))
+    if missing_descriptions:
+        crawl_findings.append(("medium", f"{len(missing_descriptions)} pages are missing a meta description"))
+    if noindex_pages:
+        crawl_findings.append(("high", f"{len(noindex_pages)} pages are marked noindex"))
+    if duplicate_title_items:
+        crawl_findings.append(("medium", f"{len(duplicate_title_items)} duplicate title groups found"))
+    if duplicate_description_items:
+        crawl_findings.append(("medium", f"{len(duplicate_description_items)} duplicate meta description groups found"))
+    if thin_content_pages:
+        crawl_findings.append(("low", f"{len(thin_content_pages)} pages have thin visible content"))
+    if pages_with_missing_image_alt:
+        crawl_findings.append(("medium", f"{len(pages_with_missing_image_alt)} pages have images missing alt text"))
+    if pages_with_uncrawlable_anchors:
+        crawl_findings.append(("medium", f"{len(pages_with_uncrawlable_anchors)} pages have anchors without href"))
+    crawl_findings.sort(key=lambda item: (SEO_SEVERITY_ORDER[item[0]], item[1]))
 
     lines = [
         f"Crawl SEO audit for {normalized_start}",
@@ -1922,9 +2371,13 @@ async def crawl_site_seo(start_url: str, max_pages: int = 10) -> str:
         f"Pages missing title: {len(missing_titles)}",
         f"Pages missing meta description: {len(missing_descriptions)}",
         f"Pages marked noindex: {len(noindex_pages)}",
+        f"Pages with thin content: {len(thin_content_pages)}",
+        f"Pages with images missing alt text: {len(pages_with_missing_image_alt)}",
+        f"Pages with anchors without href: {len(pages_with_uncrawlable_anchors)}",
         f"Duplicate titles: {len(duplicate_title_items)}",
         f"Duplicate meta descriptions: {len(duplicate_description_items)}",
     ]
+    lines.extend(_summarize_priority_findings(crawl_findings))
 
     if missing_titles:
         lines.append("Missing titles:")
@@ -1937,6 +2390,18 @@ async def crawl_site_seo(start_url: str, max_pages: int = 10) -> str:
     if noindex_pages:
         lines.append("Noindex pages:")
         for item in noindex_pages[:10]:
+            lines.append(f"  {item}")
+    if thin_content_pages:
+        lines.append("Thin content pages:")
+        for item in thin_content_pages[:10]:
+            lines.append(f"  {item}")
+    if pages_with_missing_image_alt:
+        lines.append("Pages with images missing alt text:")
+        for item in pages_with_missing_image_alt[:10]:
+            lines.append(f"  {item}")
+    if pages_with_uncrawlable_anchors:
+        lines.append("Pages with anchors without href:")
+        for item in pages_with_uncrawlable_anchors[:10]:
             lines.append(f"  {item}")
     if duplicate_title_items:
         lines.append("Duplicate titles:")

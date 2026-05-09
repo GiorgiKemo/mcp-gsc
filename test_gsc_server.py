@@ -18,6 +18,8 @@ import httpx
 os.environ.setdefault("GSC_SKIP_OAUTH", "true")
 os.environ.setdefault("GSC_DATA_STATE", "all")
 os.environ.setdefault("CRUX_API_KEY", "test-key-123")
+os.environ.setdefault("SEO_AUDIT_ENABLE_WRITE_TOOLS", "true")
+os.environ.setdefault("SEO_AUDIT_ALLOW_NPX_LIGHTHOUSE", "true")
 
 import gsc_server as gs
 
@@ -80,6 +82,16 @@ class TestConfiguration:
     def test_possible_credential_paths_is_list(self):
         assert isinstance(gs.POSSIBLE_CREDENTIAL_PATHS, list)
         assert len(gs.POSSIBLE_CREDENTIAL_PATHS) >= 2
+
+    def test_private_urls_are_blocked_by_default(self):
+        with pytest.raises(ValueError):
+            gs._validate_fetchable_public_url("http://127.0.0.1:4173")
+
+    @patch("gsc_server.socket.getaddrinfo")
+    def test_hostnames_resolving_to_private_ips_are_blocked(self, mock_getaddrinfo):
+        mock_getaddrinfo.return_value = [(None, None, None, None, ("10.0.0.5", 0))]
+        with pytest.raises(ValueError):
+            gs._validate_fetchable_public_url("https://internal.example.com")
 
 
 # ─── Auth Helper Tests ─────────────────────────────────────────────────────
@@ -156,6 +168,13 @@ class TestPropertyManagement:
         mock_get.return_value = svc
         result = run(gs.add_site("https://newsite.com"))
         assert "has been added" in result
+
+    @patch("gsc_server.ENABLE_WRITE_TOOLS", False)
+    @patch("gsc_server.get_gsc_service")
+    def test_add_site_requires_write_tools_enabled(self, mock_get):
+        result = run(gs.add_site("https://newsite.com"))
+        assert "Write tool disabled" in result
+        mock_get.assert_not_called()
 
     @patch("gsc_server.get_gsc_service")
     def test_delete_site_success(self, mock_get):
@@ -575,10 +594,12 @@ class TestCoreWebVitals:
         parsed = urlparse("https://example.com/")
         assert parsed.path in ("", "/")
 
-    @patch("urllib.request.urlopen")
-    def test_crux_passing_vitals(self, mock_urlopen):
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps({
+    @patch("gsc_server.httpx.AsyncClient")
+    def test_crux_passing_vitals(self, mock_client_cls):
+        response = MagicMock()
+        response.status_code = 200
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
             "record": {
                 "key": {"origin": "https://example.com"},
                 "metrics": {
@@ -588,20 +609,22 @@ class TestCoreWebVitals:
                 },
                 "collectionPeriod": {"firstDate": {"year": 2025, "month": 2}, "lastDate": {"year": 2025, "month": 3}},
             }
-        }).encode()
-        mock_resp.__enter__ = lambda s: s
-        mock_resp.__exit__ = MagicMock(return_value=False)
-        mock_urlopen.return_value = mock_resp
+        }
+        client = AsyncMock()
+        client.post.return_value = response
+        mock_client_cls.return_value.__aenter__.return_value = client
 
         result = run(gs.get_core_web_vitals("https://example.com"))
         assert "PASSING" in result
         assert "LCP" in result
         assert "GOOD" in result
 
-    @patch("urllib.request.urlopen")
-    def test_crux_failing_vitals(self, mock_urlopen):
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps({
+    @patch("gsc_server.httpx.AsyncClient")
+    def test_crux_failing_vitals(self, mock_client_cls):
+        response = MagicMock()
+        response.status_code = 200
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
             "record": {
                 "key": {"origin": "https://slow.com"},
                 "metrics": {
@@ -611,10 +634,10 @@ class TestCoreWebVitals:
                 },
                 "collectionPeriod": {"firstDate": {"year": 2025, "month": 2}, "lastDate": {"year": 2025, "month": 3}},
             }
-        }).encode()
-        mock_resp.__enter__ = lambda s: s
-        mock_resp.__exit__ = MagicMock(return_value=False)
-        mock_urlopen.return_value = mock_resp
+        }
+        client = AsyncMock()
+        client.post.return_value = response
+        mock_client_cls.return_value.__aenter__.return_value = client
 
         result = run(gs.get_core_web_vitals("https://slow.com"))
         assert "FAILING" in result
@@ -871,6 +894,22 @@ class TestPublicWebAuditTools:
         result = run(gs.get_pagespeed_insights("https://example.com"))
         assert "quota was exceeded" in result
 
+    @patch("gsc_server.run_lighthouse_audit", new_callable=AsyncMock)
+    @patch("gsc_server.httpx.AsyncClient")
+    def test_get_pagespeed_insights_falls_back_to_lighthouse(self, mock_client_cls, mock_lighthouse):
+        request = httpx.Request("GET", "https://www.googleapis.com/pagespeedonline/v5/runPagespeed")
+        response = httpx.Response(429, text='{"error":"quota"}', request=request)
+
+        client = AsyncMock()
+        client.get.side_effect = httpx.HTTPStatusError("quota", request=request, response=response)
+        mock_client_cls.return_value.__aenter__.return_value = client
+        mock_lighthouse.return_value = "Local Lighthouse audit for https://example.com (mobile)\nCategory scores:\n  performance: 88"
+
+        result = run(gs.get_pagespeed_insights("https://example.com"))
+        assert "PageSpeed Insights error (HTTP 429)" in result
+        assert "Local Lighthouse fallback:" in result
+        assert "Local Lighthouse audit for https://example.com (mobile)" in result
+
     @patch("gsc_server.subprocess.run")
     @patch("gsc_server.shutil.which")
     def test_run_lighthouse_audit_success(self, mock_which, mock_run):
@@ -900,7 +939,7 @@ class TestPublicWebAuditTools:
     def test_run_lighthouse_audit_missing_npx(self, mock_which):
         mock_which.return_value = None
         result = run(gs.run_lighthouse_audit("https://example.com"))
-        assert "npx is not available" in result
+        assert "No Lighthouse runner available" in result
 
     @patch("gsc_server._fetch_url", new_callable=AsyncMock)
     def test_inspect_robots_txt(self, mock_fetch):
@@ -952,8 +991,69 @@ class TestPublicWebAuditTools:
         )
         result = run(gs.analyze_page_seo("https://example.com/test"))
         assert "Page SEO analysis" in result
+        assert "Priority findings:" in result
+        assert "[LOW] Missing og:title" in result
         assert "Primary heading" in result
         assert "WebPage" in result
+
+    @patch("gsc_server._fetch_url", new_callable=AsyncMock)
+    def test_analyze_page_seo_ignores_noscript_h1_and_local_canonical_noise(self, mock_fetch):
+        html = """
+        <html lang="en">
+          <head>
+            <title>Local preview page title</title>
+            <meta name="description" content="Long enough local preview description for testing the parser output." />
+            <link rel="canonical" href="https://example.com/jobs" />
+          </head>
+          <body>
+            <h1>Rendered heading</h1>
+            <noscript><h1>Fallback heading</h1></noscript>
+          </body>
+        </html>
+        """
+        mock_fetch.return_value = httpx.Response(
+            200,
+            text=html,
+            headers={"content-type": "text/html"},
+            request=httpx.Request("GET", "http://127.0.0.1:4174/jobs"),
+        )
+        result = run(gs.analyze_page_seo("http://127.0.0.1:4174/jobs"))
+        assert "H1 count: 1" in result
+        assert "Rendered heading" in result
+        assert "Canonical points to another host" not in result
+
+    @patch("gsc_server._fetch_url", new_callable=AsyncMock)
+    def test_analyze_page_seo_reports_image_link_and_structured_data_issues(self, mock_fetch):
+        html = """
+        <html>
+          <head>
+            <title>Image and link SEO test page</title>
+            <meta name="description" content="This page has enough description text to validate image, link, and JSON-LD audit signals." />
+            <meta name="robots" content="nofollow" />
+            <link rel="canonical" href="https://example.com/test#section" />
+            <script type="application/ld+json">{"@context":"https://schema.org","@type":</script>
+          </head>
+          <body>
+            <h1>Primary heading</h1>
+            <img src="/truck.jpg" />
+            <a>JavaScript only link</a>
+            <a href="/jobs"></a>
+          </body>
+        </html>
+        """
+        mock_fetch.return_value = httpx.Response(
+            200,
+            text=html,
+            headers={"content-type": "text/html"},
+            request=httpx.Request("GET", "https://example.com/test"),
+        )
+        result = run(gs.analyze_page_seo("https://example.com/test"))
+        assert "Images: 1 total, 1 missing alt" in result
+        assert "Links: 2 total" in result
+        assert "[HIGH] Page instructs crawlers not to follow links" in result
+        assert "[MEDIUM] Anchors without href are not crawlable (1)" in result
+        assert "[MEDIUM] Invalid JSON-LD scripts found (1)" in result
+        assert "[MEDIUM] Canonical URL contains a fragment" in result
 
     @patch("gsc_server._fetch_url", new_callable=AsyncMock)
     def test_crawl_site_seo(self, mock_fetch):
@@ -979,6 +1079,8 @@ class TestPublicWebAuditTools:
         result = run(gs.crawl_site_seo("https://example.com", max_pages=2))
         assert "Pages crawled: 2 / 2" in result
         assert "Pages missing meta description: 1" in result
+        assert "Priority findings:" in result
+        assert "Pages with thin content: 2" in result
 
     @patch("gsc_server.run_lighthouse_audit", new_callable=AsyncMock)
     @patch("gsc_server.crawl_site_seo", new_callable=AsyncMock)

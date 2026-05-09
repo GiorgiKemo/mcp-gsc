@@ -20,8 +20,8 @@ Forked from [AminForou/mcp-gsc](https://github.com/AminForou/mcp-gsc) and expand
 | **Indexing API** | `request_indexing`, `request_removal`, `check_indexing_notification`, `batch_request_indexing` | Submit/remove URLs from Google's index via the Indexing API |
 | **Sitemaps** | `get_sitemaps`, `submit_sitemap`, `delete_sitemap` | List, submit, and delete sitemaps |
 | **Core Web Vitals** | `get_core_web_vitals` | LCP, FID, CLS, INP, TTFB via the Chrome UX Report (CrUX) API |
-| **Performance Audits** | `get_pagespeed_insights`, `run_lighthouse_audit` | Run PageSpeed Insights and local Lighthouse audits with category scores and failing audit summaries |
-| **Technical SEO** | `inspect_robots_txt`, `analyze_sitemap`, `analyze_page_seo`, `crawl_site_seo`, `audit_live_site` | Inspect robots.txt, validate sitemaps, extract on-page SEO signals, crawl internal pages, and run a live SEO audit without GSC access |
+| **Performance Audits** | `get_pagespeed_insights`, `run_lighthouse_audit` | Run PageSpeed Insights and local Lighthouse audits with category scores, failing audit summaries, and automatic Lighthouse fallback when PSI errors or quota fails |
+| **Technical SEO** | `inspect_robots_txt`, `analyze_sitemap`, `analyze_page_seo`, `crawl_site_seo`, `audit_live_site` | Inspect robots.txt, validate sitemaps, extract on-page SEO signals, rank findings by severity, crawl internal pages, and run a live SEO audit without GSC access |
 | **SEO Analysis** | `find_striking_distance_keywords`, `detect_cannibalization`, `split_branded_queries` | Find keywords at positions 5-20, detect pages competing for the same query, split branded vs non-branded traffic |
 | **Site Audit** | `site_audit` | All-in-one report: sitemap health, indexing status, canonical mismatches, performance summary |
 | **Auth** | `reauthenticate` | Switch Google accounts by clearing cached OAuth tokens |
@@ -113,6 +113,15 @@ You can also set `GOOGLE_API_KEY`; the server uses it as the PageSpeed Insights 
 | `PAGESPEED_API_KEY` | No | none | Google API key for PageSpeed Insights / Lighthouse API calls |
 | `GOOGLE_API_KEY` | No | none | Fallback source for `PAGESPEED_API_KEY` |
 | `LIGHTHOUSE_CHROME_PATH` | No | auto-detect | Optional explicit path to Chrome/Chromium for local Lighthouse CLI |
+| `SEO_AUDIT_ENABLE_WRITE_TOOLS` | No | `false` | Enables mutating tools such as adding/removing GSC properties, sitemap submission/deletion, and Indexing API publish calls |
+| `SEO_AUDIT_ALLOW_PRIVATE_URLS` | No | `false` | Allows live audit fetches against localhost/private/reserved IPs; keep disabled except trusted local testing |
+| `SEO_AUDIT_MAX_FETCH_BYTES` | No | `5242880` | Maximum bytes read from a fetched page, robots.txt, or sitemap response |
+| `SEO_AUDIT_MAX_REDIRECTS` | No | `5` | Maximum redirects followed by live audit fetches |
+| `SEO_AUDIT_MAX_SITEMAP_URLS` | No | `50000` | Maximum sitemap URLs parsed from one sitemap document |
+| `SEO_AUDIT_MAX_CRAWL_PAGES` | No | `100` | Hard upper bound for `crawl_site_seo` and `audit_live_site` crawls |
+| `LIGHTHOUSE_BINARY` | No | auto-detect | Explicit Lighthouse executable path. Preferred over `npx` for repeatable audits |
+| `SEO_AUDIT_ALLOW_NPX_LIGHTHOUSE` | No | `false` | Allows `npx --yes lighthouse` fallback when no local Lighthouse binary is available |
+| `LIGHTHOUSE_NO_SANDBOX` | No | `false` | Adds Chrome `--no-sandbox`; use only in constrained containers that require it |
 
 ---
 
@@ -141,7 +150,7 @@ You can also set `GOOGLE_API_KEY`; the server uses it as the PageSpeed Insights 
 
 ## Tests
 
-81 tests covering all 30 tools with mocked Google/API/web-audit calls:
+87 tests covering all 30 tools with mocked Google/API/web-audit calls:
 
 ```bash
 # Activate venv first
@@ -154,9 +163,10 @@ python -m pytest test_gsc_server.py -v
 
 - **30 tools** — added PSI, local Lighthouse, robots.txt inspection, sitemap validation, page SEO analysis, crawl audits, and live site audits
 - **7 bug fixes** — sort direction mapping, origin/URL detection, empty rows crash, API key leak, blocking sleep, service caching, stale cache on reauth
-- **81-test QA suite** — coverage for GSC, CrUX, PSI, Lighthouse CLI, robots, sitemaps, crawl audits, and live-audit composition
-- **Security** — API keys redacted from error messages
-- **Performance** — Google API service objects cached, async sleep instead of blocking, plus lab-performance tooling on top of CrUX field data
+- **87-test QA suite** — coverage for GSC, CrUX, PSI, Lighthouse CLI, fallback behavior, robots, sitemaps, crawl audits, safety gates, and live-audit composition
+- **Security** — private/local network fetches blocked by default, mutating Google tools gated behind an explicit env flag, and API keys redacted from error messages
+- **Performance** — Google API service objects cached, async sleep instead of blocking, async CrUX HTTP calls, PSI-to-Lighthouse fallback, plus lab-performance tooling on top of CrUX field data
+- **Audit quality** — local-preview aware canonical warnings, visible-content parsing that ignores `noscript` duplicates, severity-ranked SEO findings, image alt audits, crawlable-link checks, invalid JSON-LD detection, viewport/lang checks, and stricter canonical/robots diagnostics
 
 ---
 
