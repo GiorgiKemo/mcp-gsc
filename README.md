@@ -1,5 +1,7 @@
 # mcp-seo-audit
 
+<!-- mcp-name: io.github.giorgikemo/mcp-seo-audit -->
+
 A Model Context Protocol (MCP) server for SEO auditing with Google Search Console, Indexing API, Chrome UX Report, PageSpeed Insights, local Lighthouse, robots.txt checks, sitemap analysis, on-page SEO inspection, crawl audits, and live site analysis. Works with Claude Code, Claude Desktop, Cursor, and any MCP-compatible client.
 
 Forked from [AminForou/mcp-gsc](https://github.com/AminForou/mcp-gsc) and expanded into a broader technical SEO and performance audit server with 30 tools and a full test suite.
@@ -49,6 +51,22 @@ Forked from [AminForou/mcp-gsc](https://github.com/AminForou/mcp-gsc) and expand
 
 ### 2. Install
 
+#### Option A: PyPI
+
+MCP clients can run the PyPI package directly:
+
+```bash
+uvx mcp-seo-audit
+```
+
+Or install it as a persistent command:
+
+```bash
+pipx install mcp-seo-audit
+```
+
+#### Option B: Source checkout
+
 ```bash
 git clone https://github.com/GiorgiKemo/mcp-seo-audit.git
 cd mcp-seo-audit
@@ -64,6 +82,26 @@ pip install -r requirements.txt
 ### 3. Configure Your MCP Client
 
 #### Claude Code (`~/.claude/settings.json`)
+
+With the PyPI package:
+
+```json
+{
+  "mcpServers": {
+    "seo-audit": {
+      "command": "uvx",
+      "args": ["mcp-seo-audit"],
+      "env": {
+        "GSC_OAUTH_CLIENT_SECRETS_FILE": "/path/to/client_secrets.json",
+        "PAGESPEED_API_KEY": "your-google-api-key",
+        "CRUX_API_KEY": "your-google-api-key"
+      }
+    }
+  }
+}
+```
+
+With a source checkout:
 
 ```json
 {
@@ -150,7 +188,7 @@ You can also set `GOOGLE_API_KEY`; the server uses it as the PageSpeed Insights 
 
 ## Tests
 
-87 tests covering all 30 tools with mocked Google/API/web-audit calls:
+96 tests covering all 30 tools with mocked Google/API/web-audit calls:
 
 ```bash
 # Activate venv first
@@ -162,8 +200,8 @@ python -m pytest test_gsc_server.py -v
 ## What Changed From the Original
 
 - **30 tools** — added PSI, local Lighthouse, robots.txt inspection, sitemap validation, page SEO analysis, crawl audits, and live site audits
-- **7 bug fixes** — sort direction mapping, origin/URL detection, empty rows crash, API key leak, blocking sleep, service caching, stale cache on reauth
-- **87-test QA suite** — coverage for GSC, CrUX, PSI, Lighthouse CLI, fallback behavior, robots, sitemaps, crawl audits, safety gates, and live-audit composition
+- **Robustness fixes** — OAuth scope alignment, sort direction mapping, origin/URL detection, sitemap BOM and plain-text handling, external redirect crawl guards, empty rows handling, API key redaction, service caching, and stale cache handling on reauth
+- **96-test QA suite** — coverage for GSC, CrUX, PSI, Lighthouse CLI, fallback behavior, robots, sitemaps, crawl audits, safety gates, auth scopes, and live-audit composition
 - **Security** — private/local network fetches blocked by default, mutating Google tools gated behind an explicit env flag, and API keys redacted from error messages
 - **Performance** — Google API service objects cached, async sleep instead of blocking, async CrUX HTTP calls, PSI-to-Lighthouse fallback, plus lab-performance tooling on top of CrUX field data
 - **Audit quality** — local-preview aware canonical warnings, visible-content parsing that ignores `noscript` duplicates, severity-ranked SEO findings, image alt audits, crawlable-link checks, invalid JSON-LD detection, viewport/lang checks, and stricter canonical/robots diagnostics
