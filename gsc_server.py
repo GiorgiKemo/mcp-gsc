@@ -86,6 +86,9 @@ GSC_SCOPES = ["https://www.googleapis.com/auth/webmasters"]
 # Indexing API scope (separate from GSC)
 INDEXING_SCOPES = ["https://www.googleapis.com/auth/indexing"]
 
+# OAuth consent should cover every Google API tool exposed by this server.
+ALL_SCOPES = GSC_SCOPES + INDEXING_SCOPES
+
 # CrUX API key (free, no OAuth needed)
 CRUX_API_KEY = os.environ.get("CRUX_API_KEY", "")
 
@@ -160,7 +163,7 @@ def get_gsc_service_oauth():
 
     if os.path.exists(TOKEN_FILE):
         try:
-            creds = Credentials.from_authorized_user_file(TOKEN_FILE, GSC_SCOPES)
+            creds = Credentials.from_authorized_user_file(TOKEN_FILE, ALL_SCOPES)
         except Exception:
             if os.path.exists(TOKEN_FILE):
                 os.remove(TOKEN_FILE)
@@ -183,7 +186,7 @@ def get_gsc_service_oauth():
                     "OAuth client secrets file not found. Please place a client_secrets.json "
                     "file in the script directory or set GSC_OAUTH_CLIENT_SECRETS_FILE."
                 )
-            flow = InstalledAppFlow.from_client_secrets_file(OAUTH_CLIENT_SECRETS_FILE, GSC_SCOPES)
+            flow = InstalledAppFlow.from_client_secrets_file(OAUTH_CLIENT_SECRETS_FILE, ALL_SCOPES)
             creds = flow.run_local_server(port=0)
             with open(TOKEN_FILE, "w") as token:
                 token.write(creds.to_json())
@@ -211,25 +214,16 @@ def get_indexing_service():
             except Exception:
                 continue
 
-    # Fall back to OAuth with indexing scope
+    # Fall back to OAuth with the same authorized-user token used by Search Console.
     if os.path.exists(TOKEN_FILE):
         try:
-            with open(TOKEN_FILE, "r") as f:
-                token_data = json.load(f)
-            with open(OAUTH_CLIENT_SECRETS_FILE, "r") as f:
-                client_data = json.load(f)
-
-            client_config = client_data.get("installed", client_data.get("web", {}))
-            creds = Credentials(
-                token=token_data.get("token"),
-                refresh_token=token_data.get("refresh_token"),
-                token_uri="https://oauth2.googleapis.com/token",
-                client_id=client_config["client_id"],
-                client_secret=client_config["client_secret"],
-                scopes=INDEXING_SCOPES,
-            )
-            if creds.expired:
+            creds = Credentials.from_authorized_user_file(TOKEN_FILE, ALL_SCOPES)
+            if not creds.valid and creds.expired and creds.refresh_token:
                 creds.refresh(Request())
+                with open(TOKEN_FILE, "w") as token:
+                    token.write(creds.to_json())
+            if not creds.valid:
+                raise ValueError("OAuth token is invalid and cannot be refreshed.")
             svc = build("indexing", "v3", credentials=creds, cache_discovery=False)
             _indexing_service_cache = svc
             return svc
@@ -280,6 +274,15 @@ def _origin_from_url(url_or_origin: str) -> str:
     url = _ensure_https_url(url_or_origin)
     parsed = urlparse(url)
     return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _url_matches_origin(url: str, origin: str) -> bool:
+    parsed_url = urlparse(_ensure_https_url(url))
+    parsed_origin = urlparse(_ensure_https_url(origin))
+    return (
+        parsed_url.scheme == parsed_origin.scheme
+        and parsed_url.netloc.lower() == parsed_origin.netloc.lower()
+    )
 
 
 def _clean_text(value: Optional[str]) -> str:
@@ -844,7 +847,24 @@ def _local_name(tag: str) -> str:
 
 
 def _parse_sitemap_document(xml_text: str) -> Dict[str, Any]:
-    root = ET.fromstring(xml_text)
+    sitemap_text = (xml_text or "").strip().lstrip("\ufeff").strip()
+    if not sitemap_text:
+        raise ValueError("Empty sitemap document.")
+
+    if not sitemap_text.startswith("<"):
+        urls = []
+        for raw_line in sitemap_text.splitlines():
+            loc = raw_line.strip()
+            if not loc or loc.startswith("#"):
+                continue
+            urls.append({"loc": loc, "lastmod": None})
+            if len(urls) >= MAX_SITEMAP_URLS:
+                break
+        if not urls:
+            raise ValueError("Plain-text sitemap contains no URLs.")
+        return {"type": "urlset", "sitemaps": [], "urls": urls, "lastmod_count": 0}
+
+    root = ET.fromstring(sitemap_text)
     root_name = _local_name(root.tag)
     if root_name == "sitemapindex":
         sitemaps = []
@@ -1147,9 +1167,14 @@ async def get_advanced_search_analytics(
         }
 
         metric_map = {"clicks": "CLICK_COUNT", "impressions": "IMPRESSION_COUNT", "ctr": "CTR", "position": "POSITION"}
-        direction_map = {"ascending": "ASCENDING", "descending": "DESCENDING"}
+        direction_map = {
+            "ascending": "ASCENDING",
+            "asc": "ASCENDING",
+            "descending": "DESCENDING",
+            "desc": "DESCENDING",
+        }
         if sort_by in metric_map:
-            resolved_direction = direction_map.get(sort_direction.lower(), sort_direction.upper())
+            resolved_direction = direction_map.get((sort_direction or "").lower().strip(), "DESCENDING")
             request["orderBy"] = [{"metric": metric_map[sort_by], "direction": resolved_direction}]
 
         active_filters = []
@@ -2291,6 +2316,20 @@ async def crawl_site_seo(start_url: str, max_pages: int = 10) -> str:
         try:
             response = await _fetch_url(current)
             final_url = str(response.url)
+            if not _url_matches_origin(final_url, origin):
+                page_summaries.append({
+                    "url": final_url,
+                    "status": response.status_code,
+                    "issues": [f"External redirect from {current}"],
+                    "notes": [],
+                    "title": "",
+                    "description": "",
+                    "word_count": 0,
+                    "images_missing_alt": 0,
+                    "links_missing_href": 0,
+                })
+                continue
+
             content_type = response.headers.get("content-type", "").lower()
             if "html" not in content_type and "<html" not in response.text[:500].lower():
                 page_summaries.append({
@@ -2321,7 +2360,7 @@ async def crawl_site_seo(start_url: str, max_pages: int = 10) -> str:
                 duplicate_descriptions[analysis["meta_description"]] += 1
 
             for discovered in _iter_internal_links(final_url, response.text):
-                if discovered.startswith(origin) and discovered not in visited and discovered not in queue and len(visited) + len(queue) < max_pages * 3:
+                if _url_matches_origin(discovered, origin) and discovered not in visited and discovered not in queue and len(visited) + len(queue) < max_pages * 3:
                     queue.append(discovered)
         except Exception as exc:
             page_summaries.append({
@@ -2875,7 +2914,7 @@ async def reauthenticate() -> str:
         if not os.path.exists(OAUTH_CLIENT_SECRETS_FILE):
             return "Error: client_secrets.json not found. Cannot start auth flow."
 
-        flow = InstalledAppFlow.from_client_secrets_file(OAUTH_CLIENT_SECRETS_FILE, GSC_SCOPES)
+        flow = InstalledAppFlow.from_client_secrets_file(OAUTH_CLIENT_SECRETS_FILE, ALL_SCOPES)
         creds = flow.run_local_server(port=0)
         with open(TOKEN_FILE, "w") as token:
             token.write(creds.to_json())

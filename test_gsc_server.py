@@ -79,6 +79,9 @@ class TestConfiguration:
     def test_indexing_scopes_defined(self):
         assert "indexing" in gs.INDEXING_SCOPES[0]
 
+    def test_all_scopes_combines_gsc_and_indexing_scopes(self):
+        assert gs.ALL_SCOPES == gs.GSC_SCOPES + gs.INDEXING_SCOPES
+
     def test_possible_credential_paths_is_list(self):
         assert isinstance(gs.POSSIBLE_CREDENTIAL_PATHS, list)
         assert len(gs.POSSIBLE_CREDENTIAL_PATHS) >= 2
@@ -117,6 +120,63 @@ class TestAuth:
         sentinel = MagicMock()
         gs._indexing_service_cache = sentinel
         assert gs.get_indexing_service() == sentinel
+        gs._indexing_service_cache = None
+
+    @patch("gsc_server.build")
+    @patch("gsc_server.InstalledAppFlow")
+    @patch("gsc_server.os.path.exists")
+    @patch("builtins.open", new_callable=mock_open)
+    def test_get_gsc_service_oauth_requests_combined_scopes(
+        self, mock_file, mock_exists, mock_flow, mock_build
+    ):
+        expected_scopes = gs.GSC_SCOPES + gs.INDEXING_SCOPES
+
+        def exists(path):
+            return path == gs.OAUTH_CLIENT_SECRETS_FILE
+
+        mock_exists.side_effect = exists
+        mock_creds = MagicMock(valid=True)
+        mock_creds.to_json.return_value = '{"token": "new"}'
+        mock_flow.from_client_secrets_file.return_value.run_local_server.return_value = mock_creds
+        mock_build.return_value = MagicMock()
+
+        gs.get_gsc_service_oauth()
+
+        mock_flow.from_client_secrets_file.assert_called_once_with(
+            gs.OAUTH_CLIENT_SECRETS_FILE, expected_scopes
+        )
+
+    @patch("gsc_server.POSSIBLE_CREDENTIAL_PATHS", [])
+    @patch("gsc_server.build")
+    @patch("gsc_server.Credentials.from_authorized_user_file")
+    @patch("gsc_server.os.path.exists")
+    @patch("builtins.open", new_callable=mock_open)
+    def test_get_indexing_service_oauth_uses_authorized_user_file_and_saves_refresh(
+        self, mock_file, mock_exists, mock_from_file, mock_build
+    ):
+        expected_scopes = gs.GSC_SCOPES + gs.INDEXING_SCOPES
+        gs._indexing_service_cache = None
+        mock_exists.return_value = True
+        mock_creds = MagicMock()
+        mock_creds.valid = False
+        mock_creds.expired = True
+        mock_creds.refresh_token = "refresh-token"
+        mock_creds.to_json.return_value = '{"token": "fresh"}'
+
+        def refresh(_request):
+            mock_creds.valid = True
+
+        mock_creds.refresh.side_effect = refresh
+        mock_from_file.return_value = mock_creds
+        mock_service = MagicMock()
+        mock_build.return_value = mock_service
+
+        result = gs.get_indexing_service()
+
+        assert result == mock_service
+        mock_from_file.assert_called_once_with(gs.TOKEN_FILE, expected_scopes)
+        mock_creds.refresh.assert_called_once()
+        mock_file().write.assert_called_once_with('{"token": "fresh"}')
         gs._indexing_service_cache = None
 
     def test_site_not_found_error_domain_property(self):
@@ -260,6 +320,27 @@ class TestSearchAnalytics:
         # Should not error — the direction gets mapped to DESCENDING
         result = run(gs.get_advanced_search_analytics("sc-domain:example.com", sort_direction="descending"))
         assert "Error" not in result or "test" in result
+
+    @pytest.mark.parametrize(
+        ("raw_direction", "expected_direction"),
+        [
+            ("asc", "ASCENDING"),
+            ("desc", "DESCENDING"),
+            ("sideways", "DESCENDING"),
+        ],
+    )
+    @patch("gsc_server.get_gsc_service")
+    def test_get_advanced_sort_direction_aliases_and_invalid_default(
+        self, mock_get, raw_direction, expected_direction
+    ):
+        svc = make_mock_service()
+        svc.searchanalytics().query().execute.return_value = {"rows": mock_search_rows(["test"])}
+        mock_get.return_value = svc
+
+        run(gs.get_advanced_search_analytics("sc-domain:example.com", sort_direction=raw_direction))
+
+        request_body = svc.searchanalytics().query.call_args.kwargs["body"]
+        assert request_body["orderBy"][0]["direction"] == expected_direction
 
 
 class TestPerformanceOverview:
@@ -462,6 +543,35 @@ class TestSitemaps:
 
 
 # ─── Indexing API Tests ────────────────────────────────────────────────────
+
+class TestPlainSitemap:
+    def test_parse_plain_text_sitemap_as_urlset(self):
+        parsed = gs._parse_sitemap_document(
+            """
+            https://example.com/
+            https://example.com/jobs
+            """
+        )
+
+        assert parsed["type"] == "urlset"
+        assert parsed["urls"] == [
+            {"loc": "https://example.com/", "lastmod": None},
+            {"loc": "https://example.com/jobs", "lastmod": None},
+        ]
+
+
+class TestBOMSitemap:
+    def test_parse_xml_sitemap_with_bom(self):
+        parsed = gs._parse_sitemap_document(
+            '\ufeff<?xml version="1.0" encoding="UTF-8"?>'
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+            "<url><loc>https://example.com/</loc></url>"
+            "</urlset>"
+        )
+
+        assert parsed["type"] == "urlset"
+        assert parsed["urls"] == [{"loc": "https://example.com/", "lastmod": None}]
+
 
 class TestIndexingAPI:
     @patch("gsc_server.get_indexing_service")
@@ -817,6 +927,9 @@ class TestReauthenticate:
         assert gs._gsc_service_cache is None
         assert gs._indexing_service_cache is None
         assert "Successfully authenticated" in result
+        mock_flow.from_client_secrets_file.assert_called_once_with(
+            gs.OAUTH_CLIENT_SECRETS_FILE, gs.GSC_SCOPES + gs.INDEXING_SCOPES
+        )
 
 
 # ─── Helper Function Tests ─────────────────────────────────────────────────
@@ -1113,6 +1226,40 @@ class TestPublicWebAuditTools:
         assert "psi report" in result
         assert "crawl report" in result
         assert "lighthouse report" in result
+
+
+class TestCrawlExternalRedirect:
+    @patch("gsc_server._fetch_url", new_callable=AsyncMock)
+    def test_external_redirect_is_recorded_but_not_audited(self, mock_fetch):
+        home = httpx.Response(
+            200,
+            text="""
+            <html lang="en">
+              <head>
+                <title>Home page title for testing</title>
+                <meta name="description" content="Home page description for testing crawl behavior." />
+                <meta name="viewport" content="width=device-width, initial-scale=1" />
+                <link rel="canonical" href="https://example.com/" />
+              </head>
+              <body><h1>Home</h1><a href="/out">External redirect</a></body>
+            </html>
+            """,
+            headers={"content-type": "text/html"},
+            request=httpx.Request("GET", "https://example.com/"),
+        )
+        external = httpx.Response(
+            200,
+            text="<html><body><h1>Third-party page</h1></body></html>",
+            headers={"content-type": "text/html"},
+            request=httpx.Request("GET", "https://third-party.example/landing"),
+        )
+        mock_fetch.side_effect = [home, external]
+
+        result = run(gs.crawl_site_seo("https://example.com", max_pages=2))
+
+        assert "External redirect from https://example.com/out" in result
+        assert "https://third-party.example/landing" in result
+        assert "Missing <title>" not in result
 
 
 class TestEdgeCases:
