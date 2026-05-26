@@ -2,6 +2,9 @@
 
 <!-- mcp-name: io.github.giorgikemo/mcp-seo-audit -->
 
+[![PyPI version](https://img.shields.io/pypi/v/mcp-seo-audit.svg)](https://pypi.org/project/mcp-seo-audit/)
+[![Python versions](https://img.shields.io/pypi/pyversions/mcp-seo-audit.svg)](https://pypi.org/project/mcp-seo-audit/)
+
 A Model Context Protocol (MCP) server for SEO auditing with Google Search Console, Indexing API, Chrome UX Report, PageSpeed Insights, local Lighthouse, robots.txt checks, sitemap analysis, on-page SEO inspection, crawl audits, and live site analysis. Works with Claude Code, Claude Desktop, Cursor, and any MCP-compatible client.
 
 Forked from [AminForou/mcp-gsc](https://github.com/AminForou/mcp-gsc) and expanded into a broader technical SEO and performance audit server with 30 tools and a full test suite.
