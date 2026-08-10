@@ -827,6 +827,26 @@ class TestBrandedQueries:
         assert "Non-Branded" in result
         assert "100" in result
         assert "50" in result
+        assert "Query-visible total" in result
+        assert "Property total" in result
+        assert "Non-branded share of query-visible data: 33% of clicks, 83% of impressions" in result
+        assert "Query coverage vs property total: 100% of clicks, 100% of impressions" in result
+        assert "anonymized queries" in result
+
+    @patch("gsc_server.get_gsc_service")
+    def test_discloses_incomplete_query_coverage(self, mock_get):
+        svc = make_mock_service()
+        svc.searchanalytics().query().execute.side_effect = [
+            {"rows": []},
+            {"rows": [{"keys": ["cdl jobs"], "clicks": 1, "impressions": 100}]},
+            {"rows": [{"clicks": 20, "impressions": 1000}]},
+        ]
+        mock_get.return_value = svc
+
+        result = run(gs.split_branded_queries("sc-domain:example.com", "cdljobscenter"))
+
+        assert "Non-branded share of query-visible data: 100% of clicks, 100% of impressions" in result
+        assert "Query coverage vs property total: 5% of clicks, 10% of impressions" in result
 
     @patch("gsc_server.get_gsc_service")
     def test_branded_empty_total(self, mock_get):
@@ -960,6 +980,25 @@ class TestHelpers:
 # ─── Edge Case / Regression Tests ─────────────────────────────────────────
 
 class TestPublicWebAuditTools:
+    def test_buffer_decoded_response_removes_stale_encoding_headers(self):
+        request = httpx.Request("GET", "https://example.com/")
+        source = httpx.Response(
+            200,
+            headers={
+                "content-encoding": "gzip",
+                "content-length": "42",
+                "content-type": "text/html; charset=utf-8",
+            },
+            request=request,
+        )
+
+        response = gs._buffer_decoded_response(source, b"<html><body>decoded</body></html>")
+
+        assert response.text == "<html><body>decoded</body></html>"
+        assert "content-encoding" not in response.headers
+        assert response.headers["content-length"] == str(len(response.content))
+        assert response.headers["content-type"] == "text/html; charset=utf-8"
+
     @patch("gsc_server.httpx.AsyncClient")
     def test_get_pagespeed_insights_success(self, mock_client_cls):
         response = MagicMock()
@@ -1260,6 +1299,38 @@ class TestCrawlExternalRedirect:
         assert "External redirect from https://example.com/out" in result
         assert "https://third-party.example/landing" in result
         assert "Missing <title>" not in result
+
+
+class TestCrawlNoindexPages:
+    @patch("gsc_server._fetch_url", new_callable=AsyncMock)
+    def test_noindex_utility_page_does_not_pollute_indexable_page_metrics(self, mock_fetch):
+        shared_head = """
+          <title>Example site title</title>
+          <meta name="description" content="Example site description long enough for a useful search snippet and crawl test." />
+          <meta name="viewport" content="width=device-width, initial-scale=1" />
+        """
+        home = httpx.Response(
+            200,
+            text=f"<html lang='en'><head>{shared_head}</head><body><h1>Home</h1><a href='/signin'>Sign in</a></body></html>",
+            headers={"content-type": "text/html"},
+            request=httpx.Request("GET", "https://example.com/"),
+        )
+        signin = httpx.Response(
+            200,
+            text=f"<html lang='en'><head>{shared_head}<meta name='robots' content='noindex, nofollow' /></head><body>Sign in</body></html>",
+            headers={"content-type": "text/html"},
+            request=httpx.Request("GET", "https://example.com/signin"),
+        )
+        mock_fetch.side_effect = [home, signin]
+
+        result = run(gs.crawl_site_seo("https://example.com", max_pages=2))
+
+        assert "Pages marked noindex: 1" in result
+        assert "Pages with thin content: 1" in result
+        assert "Duplicate titles: 0" in result
+        assert "Duplicate meta descriptions: 0" in result
+        assert "pages are marked noindex" not in result
+        assert "https://example.com/signin ->" not in result
 
 
 class TestEdgeCases:

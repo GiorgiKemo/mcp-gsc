@@ -492,6 +492,23 @@ def _canonicalize_crawl_url(base_url: str, href: str) -> Optional[str]:
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", "", ""))
 
 
+def _buffer_decoded_response(response: httpx.Response, content: bytes) -> httpx.Response:
+    # aiter_bytes() has already decoded gzip, Brotli, and other transfer encodings.
+    # Retaining those headers would make the cloned response decode the body twice.
+    headers = [
+        (name, value)
+        for name, value in response.headers.multi_items()
+        if name.lower() not in {"content-encoding", "content-length"}
+    ]
+    return httpx.Response(
+        response.status_code,
+        headers=headers,
+        content=content,
+        request=response.request,
+        extensions=response.extensions,
+    )
+
+
 async def _fetch_url(
     url: str,
     *,
@@ -520,13 +537,7 @@ async def _fetch_url(
                         raise ValueError(f"Too many redirects while fetching {url}.")
                     location = response.headers.get("location")
                     if not location:
-                        return httpx.Response(
-                            response.status_code,
-                            headers=response.headers,
-                            content=b"",
-                            request=response.request,
-                            extensions=response.extensions,
-                        )
+                        return _buffer_decoded_response(response, b"")
                     current_url = _validate_fetchable_public_url(urljoin(str(response.url), location))
                     redirects_followed += 1
                     continue
@@ -541,13 +552,7 @@ async def _fetch_url(
                         )
                     chunks.append(chunk)
 
-                return httpx.Response(
-                    response.status_code,
-                    headers=response.headers,
-                    content=b"".join(chunks),
-                    request=response.request,
-                    extensions=response.extensions,
-                )
+                return _buffer_decoded_response(response, b"".join(chunks))
             finally:
                 await response.aclose()
 
@@ -2342,11 +2347,14 @@ async def crawl_site_seo(start_url: str, max_pages: int = 10) -> str:
                 continue
 
             analysis = _analyze_html_document(final_url, response.status_code, dict(response.headers), response.text)
+            is_noindex = "Page is explicitly marked noindex" in analysis["issues"]
             page_summaries.append({
                 "url": final_url,
                 "status": response.status_code,
                 "issues": analysis["issues"],
                 "notes": analysis["notes"],
+                "noindex": is_noindex,
+                "is_start_page": current == normalized_start,
                 "title": analysis["title"],
                 "description": analysis["meta_description"],
                 "word_count": analysis["body_word_count"],
@@ -2354,9 +2362,9 @@ async def crawl_site_seo(start_url: str, max_pages: int = 10) -> str:
                 "links_missing_href": len(analysis["links"]["missing_href"]),
             })
 
-            if analysis["title"]:
+            if analysis["title"] and not is_noindex:
                 duplicate_titles[analysis["title"]] += 1
-            if analysis["meta_description"]:
+            if analysis["meta_description"] and not is_noindex:
                 duplicate_descriptions[analysis["meta_description"]] += 1
 
             for discovered in _iter_internal_links(final_url, response.text):
@@ -2372,10 +2380,11 @@ async def crawl_site_seo(start_url: str, max_pages: int = 10) -> str:
                 "word_count": 0,
             })
 
-    missing_titles = [page["url"] for page in page_summaries if "Missing <title>" in page.get("issues", [])]
-    missing_descriptions = [page["url"] for page in page_summaries if "Missing meta description" in page.get("issues", [])]
+    missing_titles = [page["url"] for page in page_summaries if not page.get("noindex") and "Missing <title>" in page.get("issues", [])]
+    missing_descriptions = [page["url"] for page in page_summaries if not page.get("noindex") and "Missing meta description" in page.get("issues", [])]
     noindex_pages = [page["url"] for page in page_summaries if "Page is explicitly marked noindex" in page.get("issues", [])]
-    thin_content_pages = [page["url"] for page in page_summaries if page.get("word_count", 0) > 0 and page.get("word_count", 0) < 80]
+    start_noindex_pages = [page["url"] for page in page_summaries if page.get("noindex") and page.get("is_start_page")]
+    thin_content_pages = [page["url"] for page in page_summaries if not page.get("noindex") and page.get("word_count", 0) > 0 and page.get("word_count", 0) < 80]
     duplicate_title_items = [(title, count) for title, count in duplicate_titles.items() if title and count > 1]
     duplicate_description_items = [(desc, count) for desc, count in duplicate_descriptions.items() if desc and count > 1]
     fetch_error_pages = [page["url"] for page in page_summaries if any(str(issue).startswith("Fetch error:") for issue in page.get("issues", []))]
@@ -2389,8 +2398,8 @@ async def crawl_site_seo(start_url: str, max_pages: int = 10) -> str:
         crawl_findings.append(("high", f"{len(missing_titles)} pages are missing a title tag"))
     if missing_descriptions:
         crawl_findings.append(("medium", f"{len(missing_descriptions)} pages are missing a meta description"))
-    if noindex_pages:
-        crawl_findings.append(("high", f"{len(noindex_pages)} pages are marked noindex"))
+    if start_noindex_pages:
+        crawl_findings.append(("high", "The crawl start page is marked noindex"))
     if duplicate_title_items:
         crawl_findings.append(("medium", f"{len(duplicate_title_items)} duplicate title groups found"))
     if duplicate_description_items:
@@ -2451,7 +2460,7 @@ async def crawl_site_seo(start_url: str, max_pages: int = 10) -> str:
         for description, count in duplicate_description_items[:10]:
             lines.append(f"  {count} pages -> {_clip(description, 140)}")
 
-    issue_pages = [page for page in page_summaries if page.get("issues")]
+    issue_pages = [page for page in page_summaries if page.get("issues") and (not page.get("noindex") or page.get("is_start_page"))]
     if issue_pages:
         lines.append("Pages with issues:")
         for page in issue_pages[:10]:
@@ -2684,6 +2693,10 @@ async def split_branded_queries(site_url: str, brand_name: str, days: int = 28) 
         days: Days to look back (default: 28)
     """
     try:
+        brand_pattern = re.escape(brand_name.strip())
+        if not brand_pattern:
+            return "Brand name must not be empty."
+
         service = get_gsc_service()
         end_date = datetime.now().date()
         start_date = end_date - timedelta(days=days)
@@ -2693,9 +2706,9 @@ async def split_branded_queries(site_url: str, brand_name: str, days: int = 28) 
         branded = service.searchanalytics().query(
             siteUrl=site_url,
             body={
-                **date_range, "dimensions": ["query"], "rowLimit": 500, "dataState": DATA_STATE,
+                **date_range, "dimensions": ["query"], "rowLimit": 25000, "dataState": DATA_STATE,
                 "dimensionFilterGroups": [{"filters": [
-                    {"dimension": "query", "operator": "includingRegex", "expression": f"(?i){brand_name}"}
+                    {"dimension": "query", "operator": "includingRegex", "expression": f"(?i){brand_pattern}"}
                 ]}],
             },
         ).execute()
@@ -2704,9 +2717,9 @@ async def split_branded_queries(site_url: str, brand_name: str, days: int = 28) 
         non_branded = service.searchanalytics().query(
             siteUrl=site_url,
             body={
-                **date_range, "dimensions": ["query"], "rowLimit": 500, "dataState": DATA_STATE,
+                **date_range, "dimensions": ["query"], "rowLimit": 25000, "dataState": DATA_STATE,
                 "dimensionFilterGroups": [{"filters": [
-                    {"dimension": "query", "operator": "excludingRegex", "expression": f"(?i){brand_name}"}
+                    {"dimension": "query", "operator": "excludingRegex", "expression": f"(?i){brand_pattern}"}
                 ]}],
             },
         ).execute()
@@ -2730,6 +2743,9 @@ async def split_branded_queries(site_url: str, brand_name: str, days: int = 28) 
 
         b_clicks, b_imp, b_ctr = sum_metrics(branded_rows)
         nb_clicks, nb_imp, nb_ctr = sum_metrics(non_branded_rows)
+        visible_clicks = b_clicks + nb_clicks
+        visible_imp = b_imp + nb_imp
+        visible_ctr = (visible_clicks / visible_imp * 100) if visible_imp else 0
         t_clicks = total_row.get("clicks", 0)
         t_imp = total_row.get("impressions", 0)
 
@@ -2741,9 +2757,12 @@ async def split_branded_queries(site_url: str, brand_name: str, days: int = 28) 
             "-" * 60,
             f"{'Branded':20} | {b_clicks:>8,} | {b_imp:>12,} | {b_ctr:>5.1f}%",
             f"{'Non-Branded':20} | {nb_clicks:>8,} | {nb_imp:>12,} | {nb_ctr:>5.1f}%",
-            f"{'Total':20} | {t_clicks:>8,} | {t_imp:>12,} | {(t_clicks / t_imp * 100) if t_imp else 0:>5.1f}%",
+            f"{'Query-visible total':20} | {visible_clicks:>8,} | {visible_imp:>12,} | {visible_ctr:>5.1f}%",
+            f"{'Property total':20} | {t_clicks:>8,} | {t_imp:>12,} | {(t_clicks / t_imp * 100) if t_imp else 0:>5.1f}%",
             "-" * 60,
-            f"Non-branded share: {(nb_clicks / t_clicks * 100) if t_clicks else 0:.0f}% of clicks, {(nb_imp / t_imp * 100) if t_imp else 0:.0f}% of impressions",
+            f"Non-branded share of query-visible data: {(nb_clicks / visible_clicks * 100) if visible_clicks else 0:.0f}% of clicks, {(nb_imp / visible_imp * 100) if visible_imp else 0:.0f}% of impressions",
+            f"Query coverage vs property total: {(visible_clicks / t_clicks * 100) if t_clicks else 0:.0f}% of clicks, {(visible_imp / t_imp * 100) if t_imp else 0:.0f}% of impressions",
+            "Note: Search Console omits anonymized queries from query-dimension rows, so query-visible totals can be lower than property totals.",
         ]
 
         if non_branded_rows:
